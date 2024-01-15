@@ -6,6 +6,8 @@ SISL_OPTION_GROUP(homeobject,
                   (executor_type, "", "executor", "Executor to use for Future deferal",
                    ::cxxopts::value< std::string >()->default_value("immediate"), "immediate|cpu|io"));
 
+SISL_LOGGING_DEF(HOMEOBJECT_LOG_MODS)
+
 namespace homeobject {
 
 HomeObjectImpl::HomeObjectImpl(std::weak_ptr< HomeObjectApplication >&& application) :
