@@ -135,7 +135,7 @@ public:
     // Get the current application/server repl uuid
     virtual homestore::replica_id_t get_my_repl_id() const override {
         // return home_object_->our_uuid();
-        return home_object_->application()->discover_svcid(boost::uuids::uuid());
+        return home_object_->application()->discover_svcid(std::nullopt);
     }
 
 private:
