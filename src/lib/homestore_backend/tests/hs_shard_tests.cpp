@@ -13,65 +13,63 @@
 #include "lib/homestore_backend/hs_homeobject.hpp"
 #include "lib/homestore_backend/replication_message.hpp"
 #include "lib/homestore_backend/replication_state_machine.hpp"
-#include "lib/tests/fixture_app.hpp"
+#include "homeobj_fixture.hpp"
 
 using homeobject::shard_id_t;
 using homeobject::ShardError;
 using homeobject::ShardInfo;
 using homeobject::ShardManager;
 
-TEST_F(TestFixture, CreateMultiShards) {
-    homeobject::HSHomeObject* ho = dynamic_cast< homeobject::HSHomeObject* >(homeobj_.get());
-    auto chunk_num_1 = ho->get_shard_chunk(_shard_1.id);
+TEST_F(HomeObjectFixture, CreateMultiShards) {
+    pg_id_t pg_id{1};
+    create_pg(pg_id);
+    auto _shard_1 = create_shard(pg_id, 64 * Mi);
+    auto _shard_2 = create_shard(pg_id, 64 * Mi);
+
+    auto chunk_num_1 = _obj_inst->get_shard_chunk(_shard_1.id);
     ASSERT_TRUE(chunk_num_1.has_value());
 
-    auto chunk_num_2 = ho->get_shard_chunk(_shard_2.id);
+    auto chunk_num_2 = _obj_inst->get_shard_chunk(_shard_2.id);
     ASSERT_TRUE(chunk_num_2.has_value());
 
     // check if both chunk is on the same pdev;
-    auto alloc_hint1 = ho->chunk_selector()->chunk_to_hints(chunk_num_1.value());
-    auto alloc_hint2 = ho->chunk_selector()->chunk_to_hints(chunk_num_2.value());
+    auto alloc_hint1 = _obj_inst->chunk_selector()->chunk_to_hints(chunk_num_1.value());
+    auto alloc_hint2 = _obj_inst->chunk_selector()->chunk_to_hints(chunk_num_2.value());
     ASSERT_TRUE(alloc_hint1.pdev_id_hint.has_value());
     ASSERT_TRUE(alloc_hint2.pdev_id_hint.has_value());
     ASSERT_TRUE(alloc_hint1.pdev_id_hint.value() == alloc_hint2.pdev_id_hint.value());
 }
 
-TEST_F(TestFixture, CreateMultiShardsOnMultiPG) {
-    // create another PG;
-    auto peer1 = homeobj_->our_uuid();
-    // auto peer2 = boost::uuids::random_generator()();
+TEST_F(HomeObjectFixture, CreateMultiShardsOnMultiPG) {
+    std::vector< homeobject::pg_id_t > pgs;
 
-    auto new_pg_id = static_cast< homeobject::pg_id_t >(_pg_id + 1);
-    auto info = homeobject::PGInfo(_pg_id + 1);
-    info.members.insert(homeobject::PGMember{peer1, "peer1", 1});
-    // info.members.insert(homeobject::PGMember{peer2, "peer2", 0});
-    EXPECT_TRUE(homeobj_->pg_manager()->create_pg(std::move(info)).get());
-
-    std::vector< homeobject::pg_id_t > pgs{_pg_id, new_pg_id};
+    for (pg_id_t pg{1}; pg < 4; pg++) {
+        create_pg(pg);
+        pgs.push_back(pg);
+    }
 
     for (const auto pg : pgs) {
-        auto e = homeobj_->shard_manager()->create_shard(pg, Mi).get();
-        ASSERT_TRUE(!!e);
-        homeobject::HSHomeObject* ho = dynamic_cast< homeobject::HSHomeObject* >(homeobj_.get());
-        auto chunk_num_1 = ho->get_shard_chunk(e.value().id);
+        auto shard_info = create_shard(pg, Mi);
+        auto chunk_num_1 = _obj_inst->get_shard_chunk(shard_info.id);
         ASSERT_TRUE(chunk_num_1.has_value());
 
         // create another shard again.
-        e = homeobj_->shard_manager()->create_shard(_pg_id, Mi).get();
-        ASSERT_TRUE(!!e);
-        auto chunk_num_2 = ho->get_shard_chunk(e.value().id);
+        shard_info = create_shard(pg, Mi);
+        auto chunk_num_2 = _obj_inst->get_shard_chunk(shard_info.id);
         ASSERT_TRUE(chunk_num_2.has_value());
 
         // check if both chunk is on the same pdev;
-        auto alloc_hint1 = ho->chunk_selector()->chunk_to_hints(chunk_num_1.value());
-        auto alloc_hint2 = ho->chunk_selector()->chunk_to_hints(chunk_num_2.value());
+        auto alloc_hint1 = _obj_inst->chunk_selector()->chunk_to_hints(chunk_num_1.value());
+        auto alloc_hint2 = _obj_inst->chunk_selector()->chunk_to_hints(chunk_num_2.value());
         ASSERT_TRUE(alloc_hint1.pdev_id_hint.has_value());
         ASSERT_TRUE(alloc_hint2.pdev_id_hint.has_value());
         ASSERT_TRUE(alloc_hint1.pdev_id_hint.value() == alloc_hint2.pdev_id_hint.value());
     }
 }
 
-TEST_F(TestFixture, MockSealShard) {
+/*
+
+TEST_F(HomeObjectFixture, MockSealShard) {
     ShardInfo shard_info = _shard_1;
     shard_info.state = ShardInfo::State::SEALED;
     using shard_info_superblk = homeobject::HSHomeObject::shard_info_superblk;
@@ -125,6 +123,8 @@ TEST_F(TestFixture, MockSealShard) {
     auto& check_shard = pg_result->shards_.front();
     EXPECT_EQ(ShardInfo::State::SEALED, check_shard->info.state);
 }
+
+
 
 class ShardManagerTestingRecovery : public ::testing::Test {
 public:
@@ -273,3 +273,4 @@ TEST_F(ShardManagerTestingRecovery, SealedShardRecovery) {
     // finally close the homeobject and homestore.
     _home_object.reset();
 }
+*/

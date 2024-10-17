@@ -12,8 +12,9 @@
 #define private public
 
 #include "lib/homestore_backend/hs_homeobject.hpp"
-#include "lib/tests/fixture_app.hpp"
 #include "bits_generator.hpp"
+#include "hs_repl_test_helper.hpp"
+
 using namespace std::chrono_literals;
 
 using homeobject::BlobError;
@@ -24,35 +25,171 @@ using homeobject::ShardError;
 using namespace homeobject;
 
 #define hex_bytes(buffer, len) fmt::format("{}", spdlog::to_hex((buffer), (buffer) + (len)))
+
+extern std::unique_ptr< test_common::HSReplTestHelper > g_helper;
+
 class HomeObjectFixture : public ::testing::Test {
 public:
-    std::shared_ptr< FixtureApp > app;
-    std::shared_ptr< homeobject::HomeObject > _obj_inst;
+    std::shared_ptr< homeobject::HSHomeObject > _obj_inst;
     std::random_device rnd{};
     std::default_random_engine rnd_engine{rnd()};
 
     void SetUp() override {
-        app = std::make_shared< FixtureApp >(true /* is_hybrid */);
-        _obj_inst = homeobject::init_homeobject(std::weak_ptr< homeobject::HomeObjectApplication >(app));
+        g_helper->sync_for_test_start();
+        _obj_inst = std::dynamic_pointer_cast< HSHomeObject >(g_helper->build_new_homeobject());
     }
 
-    void TearDown() override { app->clean(); }
+    void TearDown() override {
+        g_helper->sync_for_cleanup_start();
+        _obj_inst.reset();
+        g_helper->delete_homeobject();
+    }
 
-    void create_pg(pg_id_t pg_id) {
-        auto info = homeobject::PGInfo(pg_id);
-        auto peer1 = _obj_inst->our_uuid();
-        info.members.insert(homeobject::PGMember{peer1, "peer1", 1});
+    void restart() {
+        _obj_inst.reset();
+        _obj_inst = std::dynamic_pointer_cast< HSHomeObject >(g_helper->restart());
+        g_helper->sync_for_test_start();
+    }
 
-        // TODO:: add the following back when we have 3-replica raft test framework
-        /*
-        auto peer2 = boost::uuids::random_generator()();
-        auto peer3 = boost::uuids::random_generator()();
-        info.members.insert(homeobject::PGMember{peer2, "peer2", 0});
-        info.members.insert(homeobject::PGMember{peer3, "peer3", 0});
-        */
+    // schedule create_pg to replica_num
+    void create_pg(pg_id_t pg_id, uint32_t replica_num = 0) {
+        // g_helper->sync_for_create_pg();
+        if (pg_exist(pg_id)) {
+            LOGINFO("PG {} already exists", pg_id);
+            return;
+        }
 
-        auto p = _obj_inst->pg_manager()->create_pg(std::move(info)).get();
-        ASSERT_TRUE(!!p);
+        if (replica_num == g_helper->replica_num()) {
+            auto memebers = g_helper->members();
+            auto name = g_helper->name();
+            auto info = homeobject::PGInfo(pg_id);
+            for (const auto& member : memebers) {
+                if (replica_num == member.second) {
+                    info.members.insert(homeobject::PGMember{member.first, name + std::to_string(member.second), 1});
+                } else {
+                    info.members.insert(homeobject::PGMember{member.first, name + std::to_string(member.second), 0});
+                }
+            }
+            auto p = _obj_inst->pg_manager()->create_pg(std::move(info)).get();
+            ASSERT_TRUE(p);
+        } else {
+            // follower need to wait for pg creation to complete
+            while (!pg_exist(pg_id)) {
+                LOGINFO("follower is waiting for pg {} created", pg_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            LOGINFO("pg {} is created at follower", pg_id);
+        }
+    }
+
+    ShardInfo create_shard(pg_id_t pg_id, uint64_t size_bytes) {
+        g_helper->sync_for_create_shard();
+        if (!pg_exist(pg_id)) {
+            LOGERROR("PG {} does not exist", pg_id);
+            return {};
+        }
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        RELEASE_ASSERT(res, "can not get pg {} stats", pg_id);
+        LOGINFO("start creating shard at pg {} leader {}", pg_id, pg_stats.leader_id);
+        if (g_helper->my_replica_id() == pg_stats.leader_id) {
+            auto s = _obj_inst->shard_manager()->create_shard(pg_id, size_bytes).get();
+            RELEASE_ASSERT(!!s, "failed to create shard");
+            auto ret = s.value();
+            g_helper->set_shard_id(ret.id);
+            LOGINFO("shard {} is created at leader, gloabl shard id {}", ret.id, g_helper->get_shard_id());
+            return ret;
+        } else {
+            while (g_helper->get_shard_id() == INVALID_SHARD_ID) {
+                LOGINFO("follower is waiting for new shard created at leader, global shard id {}",
+                        g_helper->get_shard_id());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            auto shard_id = g_helper->get_shard_id();
+            LOGINFO("follower find new shard created at leader, global shard id {}", g_helper->get_shard_id());
+            while (!shard_exist(shard_id)) {
+                LOGINFO("follower is waiting for shard {} created locally", shard_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+
+            auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+            RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+            return r.value();
+        }
+    }
+
+    ShardInfo seal_shard(shard_id_t shard_id) {
+        g_helper->sync_for_create_shard();
+        if (!shard_exist(shard_id)) {
+            LOGERROR("shard {} does not exist", shard_id);
+            return {};
+        }
+        auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+        RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+        auto pg_id = r.value().placement_group;
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        RELEASE_ASSERT(res, "can not get pg {} stats", pg_id);
+        LOGINFO("start sealing shard at pg {} leader {}", pg_id, pg_stats.leader_id);
+
+        if (g_helper->my_replica_id() == pg_stats.leader_id) {
+            auto s = _obj_inst->shard_manager()->seal_shard(shard_id).get();
+            RELEASE_ASSERT(!!s, "failed to seal shard");
+            auto ret = s.value();
+            g_helper->set_shard_id(ret.id);
+            LOGINFO("shard {} is sealed at leader, gloabl shard id {}", ret.id, g_helper->get_shard_id());
+            return ret;
+        } else {
+            while (g_helper->get_shard_id() == INVALID_SHARD_ID) {
+                LOGINFO("follower is waiting for seal shard scheduled at leader, global shard id {}",
+                        g_helper->get_shard_id());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            auto shard_id = g_helper->get_shard_id();
+            LOGINFO("follower find new shard when sealing shard at leader, global shard id {}",
+                    g_helper->get_shard_id());
+            while (true) {
+                auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+                RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+                auto shard_info = r.value();
+                if (shard_info.state == ShardInfo::State::SEALED) { return shard_info; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        }
+    }
+
+    void put_blob(shard_id_t shard_id, Blob&& blob) {
+        g_helper->sync_for_put_blob();
+        if (!shard_exist(shard_id)) {
+            LOGERROR("shard {} does not exist", shard_id);
+            return;
+        }
+        auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+        RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+        auto pg_id = r.value().placement_group;
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        RELEASE_ASSERT(res, "can not get pg {} stats", pg_id);
+
+        if (g_helper->my_replica_id() == pg_stats.leader_id) {
+            auto b =
+                _obj_inst->blob_manager()->put(shard_id, Blob{sisl::io_blob_safe(512u, 512u), "test_blob", 0ul}).get();
+            RELEASE_ASSERT(!!b, "failed to pub blob");
+            LOGINFO("leader put new blob {}", b.value());
+            g_helper->set_blob_id(b.value());
+            LOGINFO("leader put new blob, global blob id {}", g_helper->get_blob_id());
+        } else {
+            while (g_helper->get_blob_id() == INVALID_BLOB_ID) {
+                LOGINFO("follower waiting for blob id {}", g_helper->get_blob_id());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            auto blob_id = g_helper->get_blob_id();
+            LOGINFO("follower succeed waiting for blob id {}", g_helper->get_blob_id());
+            while (!blob_exist(shard_id, blob_id)) {
+                LOGINFO("follower is waiting for shard {} blob {} created locally", shard_id, blob_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        }
     }
 
     static void trigger_cp(bool wait) {
@@ -185,10 +322,20 @@ public:
         }
     }
 
-    void restart() {
-        LOGINFO("Restarting homeobject.");
-        _obj_inst.reset();
-        _obj_inst = homeobject::init_homeobject(std::weak_ptr< homeobject::HomeObjectApplication >(app));
-        std::this_thread::sleep_for(std::chrono::seconds{1});
+private:
+    bool pg_exist(pg_id_t pg_id) {
+        std::vector< pg_id_t > pg_ids;
+        _obj_inst->pg_manager()->get_pg_ids(pg_ids);
+        return std::find(pg_ids.begin(), pg_ids.end(), pg_id) != pg_ids.end();
+    }
+
+    bool shard_exist(shard_id_t id) {
+        auto r = _obj_inst->shard_manager()->get_shard(id).get();
+        return !!r;
+    }
+
+    bool blob_exist(shard_id_t shard_id, blob_id_t blob_id) {
+        auto r = _obj_inst->blob_manager()->get(shard_id, blob_id).get();
+        return !!r;
     }
 };
