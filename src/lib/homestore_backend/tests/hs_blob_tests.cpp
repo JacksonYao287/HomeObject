@@ -4,9 +4,7 @@
 #include "generated/resync_blob_data_generated.h"
 
 TEST(HomeObject, BasicEquivalence) {
-    auto app = std::make_shared< FixtureApp >();
-    auto obj_inst = homeobject::init_homeobject(std::weak_ptr< homeobject::HomeObjectApplication >(app));
-    ASSERT_TRUE(!!obj_inst);
+    auto obj_inst = g_helper->get_homeobject();
     auto shard_mgr = obj_inst->shard_manager();
     auto pg_mgr = obj_inst->pg_manager();
     auto blob_mgr = obj_inst->blob_manager();
@@ -52,7 +50,8 @@ TEST_F(HomeObjectFixture, BasicPutGetDelBlobWRestart) {
     trigger_cp(true /* wait */);
 
     // Restart homeobject
-    restart();
+    g_helper->restart();
+    g_helper->sync_for_test_start();
 
     // Verify all get blobs after restart
     verify_get_blob(blob_map);
