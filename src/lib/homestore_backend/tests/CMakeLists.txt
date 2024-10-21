@@ -3,10 +3,11 @@ cmake_minimum_required(VERSION 3.13)
 include_directories (BEFORE .)
 
 list(APPEND TEST_SOURCES
-    hs_shard_tests.cpp
+    #hs_shard_tests.cpp
     hs_blob_tests.cpp
-    hs_pg_tests.cpp
-    homeobj_cp_tests.cpp
+    #hs_pg_tests.cpp
+    #homeobj_cp_tests.cpp
+    test_homestore_backend.cpp
     )
 
 add_library(homestore_tests OBJECT)

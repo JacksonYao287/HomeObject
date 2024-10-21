@@ -12,8 +12,9 @@
 #define private public
 
 #include "lib/homestore_backend/hs_homeobject.hpp"
-#include "lib/tests/fixture_app.hpp"
 #include "bits_generator.hpp"
+#include "hs_repl_test_helper.hpp"
+
 using namespace std::chrono_literals;
 
 using homeobject::BlobError;
@@ -24,35 +25,198 @@ using homeobject::ShardError;
 using namespace homeobject;
 
 #define hex_bytes(buffer, len) fmt::format("{}", spdlog::to_hex((buffer), (buffer) + (len)))
+
+extern std::unique_ptr< test_common::HSReplTestHelper > g_helper;
+
 class HomeObjectFixture : public ::testing::Test {
 public:
-    std::shared_ptr< FixtureApp > app;
-    std::shared_ptr< homeobject::HomeObject > _obj_inst;
-    std::random_device rnd{};
-    std::default_random_engine rnd_engine{rnd()};
+    std::shared_ptr< homeobject::HSHomeObject > _obj_inst;
+
+    // Create blob size in range (1, 16kb) and user key in range (1, 1kb)
+    HomeObjectFixture() : rand_blob_size{1u, 16 * 1024}, rand_user_key_size{1u, 1024} {}
 
     void SetUp() override {
-        app = std::make_shared< FixtureApp >(true /* is_hybrid */);
-        _obj_inst = homeobject::init_homeobject(std::weak_ptr< homeobject::HomeObjectApplication >(app));
+        g_helper->sync_for_test_start();
+        _obj_inst = std::dynamic_pointer_cast< HSHomeObject >(g_helper->build_new_homeobject());
+        // wait for leader to be elected
+        std::this_thread::sleep_for(std::chrono::seconds(5));
     }
 
-    void TearDown() override { app->clean(); }
+    void TearDown() override {
+        g_helper->sync_for_cleanup_start();
+        _obj_inst.reset();
+        g_helper->delete_homeobject();
+    }
 
-    void create_pg(pg_id_t pg_id) {
-        auto info = homeobject::PGInfo(pg_id);
-        auto peer1 = _obj_inst->our_uuid();
-        info.members.insert(homeobject::PGMember{peer1, "peer1", 1});
+    void restart() {
+        _obj_inst.reset();
+        _obj_inst = std::dynamic_pointer_cast< HSHomeObject >(g_helper->restart());
+        g_helper->sync_for_test_start();
+        // wait for leader to be elected
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
 
-        // TODO:: add the following back when we have 3-replica raft test framework
-        /*
-        auto peer2 = boost::uuids::random_generator()();
-        auto peer3 = boost::uuids::random_generator()();
-        info.members.insert(homeobject::PGMember{peer2, "peer2", 0});
-        info.members.insert(homeobject::PGMember{peer3, "peer3", 0});
-        */
+    // schedule create_pg to replica_num
+    void create_pg(pg_id_t pg_id, uint32_t replica_num = 0) {
+        // g_helper->sync_for_create_pg();
+        if (pg_exist(pg_id)) {
+            LOGINFO("PG {} already exists", pg_id);
+            return;
+        }
 
-        auto p = _obj_inst->pg_manager()->create_pg(std::move(info)).get();
-        ASSERT_TRUE(!!p);
+        if (replica_num == g_helper->replica_num()) {
+            auto memebers = g_helper->members();
+            auto name = g_helper->name();
+            auto info = homeobject::PGInfo(pg_id);
+            for (const auto& member : memebers) {
+                if (replica_num == member.second) {
+                    info.members.insert(homeobject::PGMember{member.first, name + std::to_string(member.second), 1});
+                } else {
+                    info.members.insert(homeobject::PGMember{member.first, name + std::to_string(member.second), 0});
+                }
+            }
+            auto p = _obj_inst->pg_manager()->create_pg(std::move(info)).get();
+            ASSERT_TRUE(p);
+        } else {
+            // follower need to wait for pg creation to complete locally
+            while (!pg_exist(pg_id)) {
+                LOGINFO("follower is waiting for pg {} created", pg_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            LOGINFO("pg {} is created at follower", pg_id);
+        }
+    }
+
+    ShardInfo create_shard(pg_id_t pg_id, uint64_t size_bytes) {
+        g_helper->sync_for_create_shard();
+        if (!pg_exist(pg_id)) {
+            LOGERROR("PG {} does not exist", pg_id);
+            return {};
+        }
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        RELEASE_ASSERT(res, "can not get pg {} stats", pg_id);
+        LOGINFO("start creating shard at pg {} leader {}", pg_id, pg_stats.leader_id);
+        if (g_helper->my_replica_id() == pg_stats.leader_id) {
+            auto s = _obj_inst->shard_manager()->create_shard(pg_id, size_bytes).get();
+            RELEASE_ASSERT(!!s, "failed to create shard");
+            auto ret = s.value();
+            g_helper->set_shard_id(ret.id);
+            LOGINFO("shard {} is created at leader, gloabl shard id {}", ret.id, g_helper->get_shard_id());
+            return ret;
+        } else {
+            while (g_helper->get_shard_id() == INVALID_SHARD_ID) {
+                LOGINFO("follower is waiting for new shard created at leader, global shard id {}",
+                        g_helper->get_shard_id());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            auto shard_id = g_helper->get_shard_id();
+            LOGINFO("follower find new shard created at leader, global shard id {}", g_helper->get_shard_id());
+            while (!shard_exist(shard_id)) {
+                LOGINFO("follower is waiting for shard {} created locally", shard_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+
+            auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+            RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+            return r.value();
+        }
+    }
+
+    ShardInfo seal_shard(shard_id_t shard_id) {
+        // before seal shard, we need to wait all the memebers to complete shard state verification
+        g_helper->sync_for_verify_start();
+        if (!shard_exist(shard_id)) {
+            LOGERROR("shard {} does not exist", shard_id);
+            return {};
+        }
+        auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+        RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+        auto pg_id = r.value().placement_group;
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        RELEASE_ASSERT(res, "can not get pg {} stats", pg_id);
+        LOGINFO("start sealing shard at pg {} leader {}", pg_id, pg_stats.leader_id);
+
+        if (g_helper->my_replica_id() == pg_stats.leader_id) {
+            auto s = _obj_inst->shard_manager()->seal_shard(shard_id).get();
+            RELEASE_ASSERT(!!s, "failed to seal shard");
+            auto ret = s.value();
+            g_helper->set_shard_id(ret.id);
+            LOGINFO("shard {} is sealed at leader, gloabl shard id {}", ret.id, g_helper->get_shard_id());
+            return ret;
+        } else {
+            while (g_helper->get_shard_id() == INVALID_SHARD_ID) {
+                LOGINFO("follower is waiting for seal shard scheduled at leader, global shard id {}",
+                        g_helper->get_shard_id());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            auto shard_id = g_helper->get_shard_id();
+            LOGINFO("follower find new shard when sealing shard at leader, global shard id {}",
+                    g_helper->get_shard_id());
+            while (true) {
+                auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+                RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+                auto shard_info = r.value();
+                if (shard_info.state == ShardInfo::State::SEALED) { return shard_info; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        }
+    }
+
+    void verify_hs_shard(const ShardInfo& lhs, const ShardInfo& rhs) {
+        // operator == is already overloaded , so we need to compare each field
+        EXPECT_EQ(lhs.id, rhs.id);
+        EXPECT_EQ(lhs.placement_group, rhs.placement_group);
+        EXPECT_EQ(lhs.state, rhs.state);
+        EXPECT_EQ(lhs.lsn, rhs.lsn);
+        EXPECT_EQ(lhs.created_time, rhs.created_time);
+        EXPECT_EQ(lhs.last_modified_time, rhs.last_modified_time);
+        EXPECT_EQ(lhs.available_capacity_bytes, rhs.available_capacity_bytes);
+        EXPECT_EQ(lhs.total_capacity_bytes, rhs.total_capacity_bytes);
+        EXPECT_EQ(lhs.deleted_capacity_bytes, rhs.deleted_capacity_bytes);
+        EXPECT_EQ(lhs.current_leader, rhs.current_leader);
+    }
+
+    void put_blob(shard_id_t shard_id, Blob&& blob) {
+        g_helper->sync_for_put_blob();
+        if (!shard_exist(shard_id)) {
+            LOGERROR("shard {} does not exist", shard_id);
+            return;
+        }
+        auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
+        RELEASE_ASSERT(!!r, "failed to get shard {}", shard_id);
+        auto pg_id = r.value().placement_group;
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        RELEASE_ASSERT(res, "can not get pg {} stats", pg_id);
+
+        if (g_helper->my_replica_id() == pg_stats.leader_id) {
+            auto b =
+                _obj_inst->blob_manager()->put(shard_id, Blob{sisl::io_blob_safe(512u, 512u), "test_blob", 0ul}).get();
+            RELEASE_ASSERT(!!b, "failed to pub blob");
+            LOGINFO("leader put new blob {}", b.value());
+            g_helper->set_blob_id(b.value());
+            LOGINFO("leader put new blob, global blob id {}", g_helper->get_blob_id());
+        } else {
+            while (g_helper->get_blob_id() == INVALID_BLOB_ID) {
+                LOGINFO("follower waiting for blob id {}", g_helper->get_blob_id());
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+            auto blob_id = g_helper->get_blob_id();
+            LOGINFO("follower succeed waiting for blob id {}", g_helper->get_blob_id());
+            while (!blob_exist(shard_id, blob_id)) {
+                LOGINFO("follower is waiting for shard {} blob {} created locally", shard_id, blob_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        }
+    }
+
+    void run_on_pg_leader(pg_id_t pg_id, auto&& lambda) {
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        RELEASE_ASSERT(res, "can not get pg {} stats", pg_id);
+        if (g_helper->my_replica_id() == pg_stats.leader_id) { lambda(); }
     }
 
     static void trigger_cp(bool wait) {
@@ -69,78 +233,96 @@ public:
         }
     }
 
-    using blob_map_t = std::map< std::tuple< pg_id_t, shard_id_t, blob_id_t >, homeobject::Blob >;
+    void put_blobs(std::map< pg_id_t, std::vector< shard_id_t > > const& pg_shard_id_vec,
+                   uint64_t const num_blobs_per_shard, std::map< pg_id_t, blob_id_t >& pg_blob_id) {
+        for (const auto& [pg_id, shard_vec] : pg_shard_id_vec) {
+            run_on_pg_leader(pg_id, [&]() {
+                blob_id_t current_blob_id{pg_blob_id[pg_id]};
+                for (const auto& shard_id : shard_vec) {
+                    for (uint64_t k = 0; k < num_blobs_per_shard; k++) {
+                        auto put_blob = build_blob(current_blob_id);
+                        auto b = _obj_inst->blob_manager()->put(shard_id, std::move(put_blob)).get();
 
-    void put_blob(blob_map_t& blob_map, std::vector< std::pair< pg_id_t, shard_id_t > > const& pg_shard_id_vec,
-                  uint64_t const num_blobs_per_shard, uint32_t const max_blob_size) {
-        std::uniform_int_distribution< uint32_t > rand_blob_size{1u, max_blob_size};
-        std::uniform_int_distribution< uint32_t > rand_user_key_size{1u, 1 * 1024};
+                        if (!b) {
+                            LOGERROR("Failed to put blob pg {} shard {} error={}", pg_id, shard_id, b.error());
+                            ASSERT_TRUE(false);
+                            continue;
+                        }
+                        auto blob_id = b.value();
+                        ASSERT_EQ(blob_id, current_blob_id) << "the predicted blob id is not correct!";
 
-        for (const auto& id : pg_shard_id_vec) {
-            int64_t pg_id = id.first, shard_id = id.second;
-            for (uint64_t k = 0; k < num_blobs_per_shard; k++) {
-                uint32_t alignment = 512;
-                // Create non 512 byte aligned address to create copy.
-                if (k % 2 == 0) alignment = 256;
-
-                std::string user_key;
-                user_key.resize(rand_user_key_size(rnd_engine));
-                BitsGenerator::gen_random_bits(user_key.size(), (uint8_t*)user_key.data());
-                auto blob_size = rand_blob_size(rnd_engine);
-                homeobject::Blob put_blob{sisl::io_blob_safe(blob_size, alignment), user_key, 42ul};
-                BitsGenerator::gen_random_bits(put_blob.body);
-                // Keep a copy of random payload to verify later.
-                homeobject::Blob clone{sisl::io_blob_safe(blob_size, alignment), user_key, 42ul};
-                std::memcpy(clone.body.bytes(), put_blob.body.bytes(), put_blob.body.size());
-
-            retry:
-                auto b = _obj_inst->blob_manager()->put(shard_id, std::move(put_blob)).get();
-                if (!b && b.error().getCode() == BlobErrorCode::NOT_LEADER) {
-                    LOGINFO("Failed to put blob due to not leader, sleep 1s and retry put", pg_id, shard_id);
-                    put_blob = homeobject::Blob{sisl::io_blob_safe(blob_size, alignment), user_key, 42ul};
-                    std::memcpy(put_blob.body.bytes(), clone.body.bytes(), clone.body.size());
-                    std::this_thread::sleep_for(1s);
-                    goto retry;
+                        current_blob_id++;
+                        LOGINFO("Put blob pg {} shard {} blob {} data {}", pg_id, shard_id, blob_id,
+                                hex_bytes(put_blob.body.cbytes(), std::min(10u, put_blob.body.size())));
+                    }
                 }
+            });
 
-                if (!b) {
-                    LOGERROR("Failed to put blob pg {} shard {} error={}", pg_id, shard_id, b.error());
-                    ASSERT_TRUE(false);
-                    continue;
-                }
-                auto blob_id = b.value();
-
-                LOGINFO("Put blob pg {} shard {} blob {} data {}", pg_id, shard_id, blob_id,
-                        hex_bytes(clone.body.cbytes(), std::min(10u, clone.body.size())));
-                blob_map.insert({{pg_id, shard_id, blob_id}, std::move(clone)});
+            auto shard_id = shard_vec.back();
+            pg_blob_id[pg_id] += num_blobs_per_shard * shard_vec.size();
+            auto blob_id = pg_blob_id[pg_id] - 1;
+            while (!blob_exist(shard_id, blob_id)) {
+                LOGINFO("waiting for shard {} blob {} created locally", shard_id, blob_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             }
         }
     }
 
-    void verify_get_blob(blob_map_t const& blob_map, bool const use_random_offset = false) {
-        uint32_t off = 0, len = 0;
-        for (const auto& [id, blob] : blob_map) {
-            int64_t pg_id = std::get< 0 >(id), shard_id = std::get< 1 >(id), blob_id = std::get< 2 >(id);
-            len = blob.body.size();
-            if (use_random_offset) {
-                std::uniform_int_distribution< uint32_t > rand_off_gen{0u, blob.body.size() - 1u};
-                std::uniform_int_distribution< uint32_t > rand_len_gen{1u, blob.body.size()};
-
-                off = rand_off_gen(rnd_engine);
-                len = rand_len_gen(rnd_engine);
-                if ((off + len) >= blob.body.size()) { len = blob.body.size() - off; }
+    void del_all_blobs(std::map< pg_id_t, std::vector< shard_id_t > > const& pg_shard_id_vec,
+                       uint64_t const num_blobs_per_shard, std::map< pg_id_t, blob_id_t > const& pg_blob_id) {
+        for (const auto& [pg_id, shard_vec] : pg_shard_id_vec) {
+            run_on_pg_leader(pg_id, [&, pg_id]() {
+                blob_id_t current_blob_id{0};
+                for (; current_blob_id != pg_blob_id[pg_id];) {
+                    for (const auto& shard_id : shard_vec) {
+                        for (uint64_t k = 0; k < num_blobs_per_shard; k++) {
+                            auto g = _obj_inst->blob_manager()->del(shard_id, current_blob_id).get();
+                            ASSERT_TRUE(g);
+                            LOGINFO("delete blob shard {} blob {}", shard_id, current_blob_id);
+                            current_blob_id++;
+                        }
+                    }
+                }
+            });
+            auto shard_id = shard_vec.back();
+            auto blob_id = pg_blob_id[pg_id] - 1;
+            while (blob_exist(shard_id, blob_id)) {
+                LOGINFO("waiting for shard {} blob {} to be deleted locally", shard_id, blob_id);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             }
+        }
+    }
 
-            auto g = _obj_inst->blob_manager()->get(shard_id, blob_id, off, len).get();
-            ASSERT_TRUE(!!g);
-            auto result = std::move(g.value());
-            LOGINFO("After restart get blob pg {} shard {} blob {} off {} len {} data {}", pg_id, shard_id, blob_id,
-                    off, len, hex_bytes(result.body.cbytes(), std::min(len, 10u)));
-            EXPECT_EQ(result.body.size(), len);
-            EXPECT_EQ(std::memcmp(result.body.bytes(), blob.body.cbytes() + off, result.body.size()), 0);
-            EXPECT_EQ(result.user_key.size(), blob.user_key.size());
-            EXPECT_EQ(blob.user_key, result.user_key);
-            EXPECT_EQ(blob.object_off, result.object_off);
+    void verify_get_blob(std::map< pg_id_t, std::vector< shard_id_t > > const& pg_shard_id_vec,
+                         bool const use_random_offset = false) {
+        uint32_t off = 0, len = 0;
+
+        for (const auto& [pg_id, shard_vec] : pg_shard_id_vec) {
+            blob_id_t current_blob_id{0};
+            for (const auto& shard_id : shard_vec) {
+                auto blob = build_blob(current_blob_id);
+                len = blob.body.size();
+                if (use_random_offset) {
+                    std::uniform_int_distribution< uint32_t > rand_off_gen{0u, blob.body.size() - 1u};
+                    std::uniform_int_distribution< uint32_t > rand_len_gen{1u, blob.body.size()};
+
+                    off = rand_off_gen(rnd_engine);
+                    len = rand_len_gen(rnd_engine);
+                    if ((off + len) >= blob.body.size()) { len = blob.body.size() - off; }
+                }
+
+                auto g = _obj_inst->blob_manager()->get(shard_id, current_blob_id, off, len).get();
+                ASSERT_TRUE(!!g);
+                auto result = std::move(g.value());
+                LOGINFO("get blob pg {} shard {} blob {} off {} len {} data {}", pg_id, shard_id, current_blob_id, off,
+                        len, hex_bytes(result.body.cbytes(), std::min(len, 10u)));
+                EXPECT_EQ(result.body.size(), len);
+                EXPECT_EQ(std::memcmp(result.body.bytes(), blob.body.cbytes() + off, result.body.size()), 0);
+                EXPECT_EQ(result.user_key.size(), blob.user_key.size());
+                EXPECT_EQ(blob.user_key, result.user_key);
+                EXPECT_EQ(blob.object_off, result.object_off);
+                current_blob_id++;
+            }
         }
     }
 
@@ -185,10 +367,44 @@ public:
         }
     }
 
-    void restart() {
-        LOGINFO("Restarting homeobject.");
-        _obj_inst.reset();
-        _obj_inst = homeobject::init_homeobject(std::weak_ptr< homeobject::HomeObjectApplication >(app));
-        std::this_thread::sleep_for(std::chrono::seconds{1});
+private:
+    bool pg_exist(pg_id_t pg_id) {
+        std::vector< pg_id_t > pg_ids;
+        _obj_inst->pg_manager()->get_pg_ids(pg_ids);
+        return std::find(pg_ids.begin(), pg_ids.end(), pg_id) != pg_ids.end();
     }
+
+    bool shard_exist(shard_id_t id) {
+        auto r = _obj_inst->shard_manager()->get_shard(id).get();
+        return !!r;
+    }
+
+    bool blob_exist(shard_id_t shard_id, blob_id_t blob_id) {
+        auto r = _obj_inst->blob_manager()->get(shard_id, blob_id).get();
+        return !!r;
+    }
+
+    homeobject::Blob build_blob(blob_id_t blob_id) {
+        uint32_t alignment = 512;
+        // Create non 512 byte aligned address to create copy.
+        if (blob_id % 2 == 0) alignment = 256;
+
+        // for different blob_id, we need to use different random engine, so that the rand_blob_size and
+        // rand_user_key_size and the content of user_key and blob will all be predictable
+        std::mt19937_64 predictable_engine(blob_id);
+
+        std::string user_key;
+        user_key.resize(rand_user_key_size(predictable_engine));
+        BitsGenerator::gen_blob_bits(user_key.size(), (uint8_t*)user_key.data(), blob_id);
+        auto blob_size = rand_blob_size(predictable_engine);
+        homeobject::Blob blob{sisl::io_blob_safe(blob_size, alignment), user_key, 42ul};
+        BitsGenerator::gen_blob_bits(blob.body, blob_id);
+        return blob;
+    }
+
+private:
+    std::random_device rnd{};
+    std::default_random_engine rnd_engine{rnd()};
+    std::uniform_int_distribution< uint32_t > rand_blob_size;
+    std::uniform_int_distribution< uint32_t > rand_user_key_size;
 };
