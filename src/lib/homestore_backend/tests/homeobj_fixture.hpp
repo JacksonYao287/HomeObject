@@ -153,7 +153,7 @@ public:
         }
     }
 
-    void put_blob(shard_id_t shard_id, Blob&& blob, bool need_sync_before_start = true) {
+    void put_blob(shard_id_t shard_id, Blob&& blob) {
         g_helper->sync();
         auto r = _obj_inst->shard_manager()->get_shard(shard_id).get();
         if (!r) return;
@@ -162,18 +162,9 @@ public:
         run_on_pg_leader(pg_id, [&]() {
             auto b = _obj_inst->blob_manager()->put(shard_id, std::move(blob)).get();
             RELEASE_ASSERT(!!b, "failed to pub blob");
-            g_helper->set_uint64_id(b.value());
         });
 
-        while (g_helper->get_uint64_id() == INVALID_UINT64_ID) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        }
-        auto blob_id = g_helper->get_uint64_id();
-
-        // make sure the blob is created locally
-        while (!blob_exist(shard_id, blob_id)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        }
+        wait_for_all(pg_id);
     }
 
     // TODO:make this run in parallel
@@ -354,7 +345,10 @@ public:
     void run_on_pg_leader(pg_id_t pg_id, auto&& lambda) {
         PGStats pg_stats;
         auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+
+        // if not in this pg, return here
         if (!res) return;
+
         if (g_helper->my_replica_id() == pg_stats.leader_id) { lambda(); }
         // TODO: add logic for check and retry of leader change if necessary
     }
@@ -373,21 +367,43 @@ public:
         return false;
     }
 
-    // wait for the last blob to be created locally, which means all the blob before this blob are created
-    void wait_for_all(shard_id_t shard_id, blob_id_t blob_id) {
-        while (true) {
-            if (blob_exist(shard_id, blob_id)) return;
-            std::this_thread::sleep_for(1s);
+    // wait for all the logs to be committed in this pg, which means all the write/modify ops are done
+    void wait_for_all(pg_id_t pg_id) {
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+
+        // if not in this pg, return here
+        if (!res) return;
+
+        // leader get and set the last_append_idx of the whole pg
+        if (g_helper->my_replica_id() == pg_stats.leader_id) {
+            for (const auto& member : pg_stats.members) {
+                if (std::get< 0 >(member) == pg_stats.leader_id) {
+                    // get the last_append_idx of leader , and all the memeber in this pg should wait for the commitment
+                    // of this log
+                    auto leader_last_append_idx = std::get< 1 >(member);
+                    g_helper->set_uint64_id(leader_last_append_idx);
+                }
+            }
         }
+
+        // all the memeber in this pg should wait for the commitment of this log
+        while (g_helper->get_uint64_id() == INVALID_UINT64_ID) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+
+        auto last_append_idx = g_helper->get_uint64_id();
+        auto repl_dev = get_pg_repl_dev(pg_id);
+        RELEASE_ASSERT(nullptr != repl_dev, "failed to get repl dev for pg {}", pg_id);
+
+        while (true) {
+            if (repl_dev->get_last_commit_lsn() >= last_append_idx) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+        g_helper->sync();
     }
 
 private:
-    bool pg_exist(pg_id_t pg_id) {
-        std::vector< pg_id_t > pg_ids;
-        _obj_inst->pg_manager()->get_pg_ids(pg_ids);
-        return std::find(pg_ids.begin(), pg_ids.end(), pg_id) != pg_ids.end();
-    }
-
     bool shard_exist(shard_id_t id) {
         auto r = _obj_inst->shard_manager()->get_shard(id).get();
         return !!r;

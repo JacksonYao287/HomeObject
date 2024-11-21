@@ -469,7 +469,10 @@ public:
      */
 
     bool release_chunk_based_on_create_shard_message(sisl::blob const& header);
+
     bool pg_exists(pg_id_t pg_id) const;
+
+    shared< homestore::ReplDev > get_pg_repl_dev(pg_id_t pg_id) const;
 
     cshared< HeapChunkSelector > chunk_selector() const { return chunk_selector_; }
 
