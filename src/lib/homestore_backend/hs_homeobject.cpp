@@ -328,7 +328,7 @@ bool HSHomeObject::pg_exists(pg_id_t pg_id) const {
     return _pg_map.contains(pg_id);
 }
 
-shared< homestore::ReplDev > get_pg_repl_dev(pg_id_t pg_id) const {
+shared< homestore::ReplDev > HSHomeObject::get_pg_repl_dev(pg_id_t pg_id) const {
     std::shared_lock lock_guard(_pg_lock);
     auto iter = _pg_map.find(pg_id);
     if (_pg_map.end() == iter) return nullptr;
