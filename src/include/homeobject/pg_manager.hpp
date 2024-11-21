@@ -62,7 +62,7 @@ struct PGStats {
     uint64_t num_tombstone_objects; // total number of tombstone objects on this PG;
     uint64_t pg_state;              // PG state;
     std::vector<
-        std::tuple< peer_id_t, std::string, uint64_t /* last_commit_lsn */, uint64_t /* last_succ_resp_us_ */ > >
+        std::tuple< peer_id_t, std::string, uint64_t /* last_append_lsn */, uint64_t /* last_succ_resp_us_ */ > >
         members;
 
     std::string to_string() {

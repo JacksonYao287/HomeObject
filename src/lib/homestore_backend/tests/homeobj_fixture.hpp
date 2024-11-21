@@ -93,7 +93,7 @@ public:
             LOGINFO("pg {} is created at leader", pg_id);
         } else {
             // follower need to wait for pg creation to complete locally
-            while (!pg_exist(pg_id)) {
+            while (!_obj_inst->pg_exist(pg_id)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             }
             LOGINFO("pg {} is created at follower", pg_id);
@@ -380,7 +380,7 @@ public:
                 if (std::get< 0 >(member) == pg_stats.leader_id) {
                     // get the last_append_idx of leader , and all the memeber in this pg should wait for the commitment
                     // of this log
-                    auto leader_last_append_idx = std::get< 1 >(member);
+                    auto leader_last_append_idx = std::get< 2 >(member);
                     g_helper->set_uint64_id(leader_last_append_idx);
                 }
             }
@@ -392,7 +392,7 @@ public:
         }
 
         auto last_append_idx = g_helper->get_uint64_id();
-        auto repl_dev = get_pg_repl_dev(pg_id);
+        auto repl_dev = _obj_inst->get_pg_repl_dev(pg_id);
         RELEASE_ASSERT(nullptr != repl_dev, "failed to get repl dev for pg {}", pg_id);
 
         while (true) {
