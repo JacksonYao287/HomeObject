@@ -70,7 +70,7 @@ TEST_F(HomeObjectFixture, PGExceedSpaceTest) {
         auto start_time = std::chrono::steady_clock::now();
         bool res = true;
         // follower need to wait for pg creation
-        while (!pg_exist(pg_id)) {
+        while (!_obj_inst->pg_exists(pg_id)) {
             auto current_time = std::chrono::steady_clock::now();
             auto duration = std::chrono::duration_cast< std::chrono::seconds >(current_time - start_time).count();
             if (duration >= 20) {
