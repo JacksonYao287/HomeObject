@@ -29,12 +29,12 @@ class HSHomeObject;
 #define GC_SCAN_INTERVAL_SEC 10llu
 // Garbage rate threshold, bigger than which, a gc task will be scheduled for a chunk
 #define GC_GARBAGE_RATE_THRESHOLD 80
-// limit the io resource that gc thread can take, so that it will not impact the client io
+// limit the io resource that gc thread can take, so that it will not impact the client io.
 // assuming the throughput of a HDD is 300M/s(including read and write) and gc can take 10% of the io resource, which is
-// 30M/s. A block is 4K, so gc can read 30M/s / 4K = 7680 blocks per second. both read and write are involved in gc.
+// 30M/s. A block is 4K, so gc can read/write 30M/s / 4K = 7680 blocks per second.
 #define MAX_READ_WRITE_BLOCK_COUNT_PER_SECOND 7680
 
-ENUM(TASK_PRIORITY, uint8_t, EMERGENT = 0, NORMAL, PRIORITY_COUNT);
+ENUM(task_priority, uint8_t, emergent = 0, normal, priority_count);
 
 using chunk_id_t = homestore::chunk_num_t;
 using GCBlobIndexTable = homestore::IndexTable< BlobRouteByChunkKey, BlobRouteValue >;
@@ -98,11 +98,10 @@ public:
             }
             return *this;
         }
+
         // disallow copy
         gc_task(const gc_task&) = delete;
         gc_task& operator=(const gc_task&) = delete;
-
-        bool operator<(const gc_task& other) const { return move_from_chunk_id_ < other.move_from_chunk_id_; }
 
     public:
         chunk_id_t get_move_from_chunk_id() const { return move_from_chunk_id_; }
@@ -125,9 +124,7 @@ public:
         RateLimiter(uint64_t refill_count_per_second);
         ~RateLimiter() = default;
         // Disallow copy and move
-        RateLimiter(const RateLimiter&) = delete;
         RateLimiter(RateLimiter&&) = delete;
-        RateLimiter& operator=(const RateLimiter&) = delete;
         RateLimiter& operator=(RateLimiter&&) = delete;
 
     public:
@@ -156,7 +153,7 @@ public:
 
     public:
         void add_reserved_chunk(chunk_id_t chunk_id);
-        void add_gc_task(TASK_PRIORITY priority, gc_task task);
+        void add_gc_task(task_priority priority, gc_task task);
         void handle_recovered_gc_task(const GCManager::gc_task_superblk* gc_task);
         void start();
         void stop();
@@ -167,16 +164,21 @@ public:
         // this should be called only after gc_task meta blk is persisted. it will update the pg index table according
         // to the gc index table. return the move_to_chunk to chunkselector and put move_from_chunk to reserved chunk
         // queue.
-        void switch_chunks_after_data_copy(chunk_id_t move_from_chunk, chunk_id_t move_to_chunk, uint8_t priority);
+        void replace_blob_index(chunk_id_t move_from_chunk, chunk_id_t move_to_chunk, uint8_t priority);
 
         // copy all the valid data from the move_from_chunk to move_to_chunk. valid data means those blobs that are not
         // tombstone in the pg index table
-        void copy_valid_data(chunk_id_t move_from_chunk, chunk_id_t move_to_chunk);
+        // return true if the data copy is successful, false otherwise.
+        bool copy_valid_data(chunk_id_t move_from_chunk, chunk_id_t move_to_chunk, bool is_emergent = false);
 
         // before we select a reserved chunk and start gc, we need:
         //  1 clear all the entries of this chunk in the gc index table
         //  2 reset this chunk to make sure it is empty.
         void purge_reserved_chunk(chunk_id_t move_to_chunk);
+
+    private:
+        // utils
+        sisl::sg_list generate_shard_super_blk_sg_list(shard_id_t shard_id);
 
     private:
         uint32_t m_pdev_id;
@@ -200,7 +202,7 @@ public:
      * @return the future to wait for the task to be completed. false means gc task fails.
      * TODO:: add error code as the returned value to indicate the reason of failure.
      */
-    folly::SemiFuture< bool > submit_gc_task(TASK_PRIORITY priority, chunk_id_t chunk_id);
+    folly::SemiFuture< bool > submit_gc_task(task_priority priority, chunk_id_t chunk_id);
 
     /**
      * try to create a new gc actor for a pdev

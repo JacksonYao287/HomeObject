@@ -16,7 +16,7 @@
 
 namespace homeobject {
 
-ENUM(ChunkState, uint8_t, AVAILABLE = 0, INUSE);
+ENUM(ChunkState, uint8_t, AVAILABLE = 0, INUSE, GC);
 
 using csharedChunk = homestore::cshared< homestore::Chunk >;
 
