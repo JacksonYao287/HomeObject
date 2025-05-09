@@ -75,7 +75,12 @@ std::shared_ptr< GCManager::pdev_gc_actor > GCManager::get_pdev_gc_actor(uint32_
 }
 
 bool GCManager::is_eligible_for_gc(std::shared_ptr< HeapChunkSelector::ExtendedVChunk > chunk) {
+    // 1 if the chunk state is inuse, it is occupied by a open shard, so it can not be selected and we don't need gc it.
+    // 2 if the chunk state is gc, it means this chunk is being gc, or this is a reserved chunk, so we don't need gc it.
+    if (chunk->m_state != ChunkState::AVAILABLE) return false;
+    // it does not belong to any pg, so we don't need to gc it.
     if (!chunk->m_pg_id.has_value()) return false;
+
     auto defrag_blk_num = chunk->get_defrag_nblks();
     auto total_blk_num = chunk->get_total_blks();
 
@@ -189,18 +194,17 @@ void GCManager::pdev_gc_actor::handle_recovered_gc_task(const GCManager::gc_task
 
     // 2 we need to select the move_from_chunk out of per pg chunk heap in chunk selector if it is a gc task with normal
     // priority. for the task with emergent priority, it is already selected since it is now used for an open shard.
-    if (priority == static_cast< uint8_t >(task_priority::normal)) {
-        auto vchunk = m_chunk_selector->get_extend_vchunk(move_from_chunk);
-        RELEASE_ASSERT(pdev_id == vchunk->get_pdev_id(), "pdev_id={} in superblk is expected to be equal to pdev_id={}",
-                       pdev_id, vchunk->get_pdev_id());
-        RELEASE_ASSERT(vchunk, "can not find vchunk for pchunk {} in chunk selector!", move_from_chunk);
-        RELEASE_ASSERT(vchunk->m_pg_id.has_value(), "chunk_id={} is expected to belong to a pg, but not !",
-                       move_from_chunk);
-        RELEASE_ASSERT(vchunk->available(), "pg_id={}, chunk_id={} is expected to be available, but not!",
-                       vchunk->m_pg_id.value(), move_from_chunk);
-        // we can safely remove the chunk from the chunk selector, since it is not used by any open shard now.
-        m_chunk_selector->select_specific_chunk(vchunk->m_pg_id.value(), vchunk->m_v_chunk_id.value());
-    }
+
+    auto vchunk = m_chunk_selector->get_extend_vchunk(move_from_chunk);
+    RELEASE_ASSERT(pdev_id == vchunk->get_pdev_id(), "pdev_id={} in superblk is expected to be equal to pdev_id={}",
+                   pdev_id, vchunk->get_pdev_id());
+    RELEASE_ASSERT(vchunk, "can not find vchunk for pchunk {} in chunk selector!", move_from_chunk);
+    RELEASE_ASSERT(vchunk->m_pg_id.has_value(), "chunk_id={} is expected to belong to a pg, but not !",
+                   move_from_chunk);
+    RELEASE_ASSERT(vchunk->available(), "pg_id={}, chunk_id={} is expected to be available, but not!",
+                   vchunk->m_pg_id.value(), move_from_chunk);
+    // we can safely remove the chunk from the chunk selector, since it is not used by any open shard now.
+    m_chunk_selector->try_mark_chunk_to_gc_state(move_from_chunk, true /* force */);
 
     // 3 now we can switch the two chunks.
     replace_blob_index(move_from_chunk, move_to_chunk, priority);
@@ -271,9 +275,6 @@ void GCManager::pdev_gc_actor::replace_blob_index(chunk_id_t move_from_chunk, ch
     move_to_vchunk->m_v_chunk_id = move_from_vchunk->m_v_chunk_id;
     move_to_vchunk->m_state =
         priority == static_cast< uint8_t >(task_priority::normal) ? ChunkState::AVAILABLE : ChunkState::INUSE;
-
-    // TODO:: need to make sure the pg_id of the exvchunk of move_from_chunk is empty, so that it will not be selected
-    // as a gc candidate chunk.
 
     // TODO:
     //  5 push the move_from_chunk to the reserved chunk queue and the move_to_chunk to the pg heap.
@@ -473,7 +474,7 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
                                 if (!ok.value()) {
                                     // if any op fails, we drop this gc task.
                                     return folly::makeFuture< std::error_code >(
-                                        std::make_error_code(std::errc::bad_address));
+                                        std::make_error_code(std::errc::operation_canceled));
                                 }
                             }
 
@@ -542,22 +543,28 @@ void GCManager::pdev_gc_actor::process_gc_task(gc_task& task) {
     auto move_from_chunk = task.get_move_from_chunk_id();
     auto move_from_vchunk = m_chunk_selector->get_extend_vchunk(move_from_chunk);
 
+    LOGINFO("start process gc task for move_from_chunk={} with priority={} ", move_from_chunk, priority);
+
     // we need to select the move_from_chunk out of the per pg chunk heap in chunk selector if it is a gc task with
     // normal priority. for the task with emergent priority, it is already selected since it is now used for an open
     // shard.
-    if (priority == static_cast< uint8_t >(task_priority::normal)) {
-        if (!move_from_vchunk->m_pg_id.has_value()) {
-            LOGWARN("move_from_chunk={} is expected to belong to a pg, but not!", move_from_chunk);
-            task.complete(false);
-            return;
-        }
-        auto selected_chunk = m_chunk_selector->select_specific_chunk(move_from_vchunk->m_pg_id.value(),
-                                                                      move_from_vchunk->m_v_chunk_id.value());
-        if (!selected_chunk) {
-            LOGWARN("move_from_chunk={} is expected to be selected, but not!", move_from_chunk);
-            task.complete(false);
-            return;
-        }
+
+    if (!move_from_vchunk->m_pg_id.has_value()) {
+        LOGWARN("move_from_chunk={} is expected to belong to a pg, but not!", move_from_chunk);
+        task.complete(false);
+        return;
+    }
+
+    LOGINFO("move_from_chunk={} belongs to pg {} ", move_from_chunk, move_from_vchunk->m_pg_id.value());
+
+    auto succeed = m_chunk_selector->try_mark_chunk_to_gc_state(
+        move_from_chunk, priority == static_cast< uint8_t >(task_priority::emergent) /* force */);
+
+    // the move_from_chunk probably now is used by an open shard, so we need to check if it can be marked as gc state.
+    if (!succeed) {
+        LOGWARN("move_from_chunk={} is expected to be mark as gc state, but not!", move_from_chunk);
+        task.complete(false);
+        return;
     }
 
     chunk_id_t move_to_chunk;

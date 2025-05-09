@@ -75,6 +75,16 @@ public:
     // be responsible to use release_chunk() interface to release it when no longer to use the chunk anymore.
     csharedChunk select_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id);
 
+    /**
+     * try to mark a chunk as gc state, so that it will not be selected by any creating shard.
+     *
+     * @param chunk_id
+     * @param force if the current state is inuse, should we force to mark it as gc. this is used for the emergent gc
+     * case
+     * @return true if success, false if the chunk is not inuse or not found.
+     */
+    bool try_mark_chunk_to_gc_state(const chunk_num_t chunk_id, bool force = false);
+
     // This function returns a chunk back to ChunkSelector.
     // It is used in two scenarios: 1. seal shard  2. create shard rollback
     bool release_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id);

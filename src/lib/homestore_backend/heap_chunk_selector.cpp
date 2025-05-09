@@ -64,8 +64,26 @@ csharedChunk HeapChunkSelector::select_chunk(homestore::blk_count_t count, const
     }
 }
 
+bool HeapChunkSelector::try_mark_chunk_to_gc_state(const chunk_num_t chunk_id, bool force) {
+    std::unique_lock lock_guard(m_chunk_selector_mtx);
+    auto chunk_it = m_chunks.find(chunk_id);
+    if (chunk_it == m_chunks.end()) {
+        LOGWARNMOD(homeobject, "No chunk found for chunk_id={}", chunk_id);
+        return false;
+    }
+
+    auto& chunk_state = chunk_it->second->m_state;
+    if (chunk_state == ChunkState::INUSE && !force) {
+        LOGWARNMOD(homeobject, "Chunk is inuse, chunk_id={}", chunk_id);
+        return false;
+    }
+
+    chunk_state = ChunkState::GC;
+    return true;
+}
+
 csharedChunk HeapChunkSelector::select_specific_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id) {
-    std::shared_lock lock_guard(m_chunk_selector_mtx);
+    std::unique_lock lock_guard(m_chunk_selector_mtx);
     auto pg_it = m_per_pg_chunks.find(pg_id);
     if (pg_it == m_per_pg_chunks.end()) {
         LOGWARNMOD(homeobject, "No pg found for pg={}", pg_id);
@@ -96,7 +114,7 @@ void HeapChunkSelector::foreach_chunks(std::function< void(csharedChunk&) >&& cb
 }
 
 bool HeapChunkSelector::release_chunk(const pg_id_t pg_id, const chunk_num_t v_chunk_id) {
-    std::shared_lock lock_guard(m_chunk_selector_mtx);
+    std::unique_lock lock_guard(m_chunk_selector_mtx);
     auto pg_it = m_per_pg_chunks.find(pg_id);
     if (pg_it == m_per_pg_chunks.end()) {
         LOGWARNMOD(homeobject, "No pg found for pg={}", pg_id);
@@ -120,7 +138,7 @@ bool HeapChunkSelector::release_chunk(const pg_id_t pg_id, const chunk_num_t v_c
 }
 
 bool HeapChunkSelector::reset_pg_chunks(pg_id_t pg_id) {
-    std::shared_lock lock_guard(m_chunk_selector_mtx);
+    std::unique_lock lock_guard(m_chunk_selector_mtx);
     auto pg_it = m_per_pg_chunks.find(pg_id);
     if (pg_it == m_per_pg_chunks.end()) {
         LOGWARNMOD(homeobject, "No pg found for pg={}", pg_id);
