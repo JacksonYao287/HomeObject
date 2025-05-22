@@ -347,7 +347,7 @@ public:
         HS_Shard(homestore::superblk< shard_info_superblk >&& sb);
         ~HS_Shard() override = default;
 
-        void update_info(const ShardInfo& info);
+        void update_info(const ShardInfo& info, std::optional< homestore::chunk_num_t > p_chunk_id = std::nullopt);
         auto p_chunk_id() const { return sb_->p_chunk_id; }
     };
 
@@ -766,6 +766,9 @@ public:
      */
     std::optional< homestore::chunk_num_t > get_shard_p_chunk_id(shard_id_t id) const;
 
+    void update_shard_meta_after_gc(const homestore::chunk_num_t move_from_chunk,
+                                    const homestore::chunk_num_t move_to_chunk);
+
     /**
      * @brief Retrieves the chunk number associated with the given shard ID.
      *
@@ -839,12 +842,16 @@ public:
 
     const auto get_shards_in_chunk(homestore::chunk_num_t chunk_id) const { return chunk_to_shards_map_.at(chunk_id); }
 
+    void update_pg_meta_after_gc(const pg_id_t pg_id, const homestore::chunk_num_t move_from_chunk,
+                                 const homestore::chunk_num_t move_to_chunk, uint64_t const& total_tombstone_blob_count);
+
     // Snapshot persistence related
     sisl::io_blob_safe get_snapshot_sb_data(homestore::group_id_t group_id);
     void update_snapshot_sb(homestore::group_id_t group_id, std::shared_ptr< homestore::snapshot_context > ctx);
     void destroy_snapshot_sb(homestore::group_id_t group_id);
     const Shard* _get_hs_shard(const shard_id_t shard_id) const;
     std::shared_ptr< GCBlobIndexTable > get_gc_index_table(std::string uuid) const;
+    void trigger_immediate_gc();
 
 private:
     std::shared_ptr< BlobIndexTable > create_pg_index_table();

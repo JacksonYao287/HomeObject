@@ -254,10 +254,8 @@ public:
                         auto tid = generateRandomTraceId();
 
                         LOGINFO("Put blob pg={} shard {} blob {} size {} data {} trace_id={}", pg_id, shard_id,
-                                current_blob_id,
-                                put_blob.body.size(),
-                                hex_bytes(put_blob.body.cbytes(), std::min(10u, put_blob.body.size())),
-                                tid);
+                                current_blob_id, put_blob.body.size(),
+                                hex_bytes(put_blob.body.cbytes(), std::min(10u, put_blob.body.size())), tid);
 
                         auto b = _obj_inst->blob_manager()->put(shard_id, std::move(put_blob), tid).get();
 
@@ -344,8 +342,8 @@ public:
             for (const auto& shard_id : shard_vec) {
                 for (uint64_t k = 0; k < num_blobs_per_shard; k++) {
                     auto tid = generateRandomTraceId();
-                    LOGDEBUG("going to verify blob pg={} shard {} blob {} trace_id={}",
-                             pg_id, shard_id, current_blob_id, tid);
+                    LOGDEBUG("going to verify blob pg={} shard {} blob {} trace_id={}", pg_id, shard_id,
+                             current_blob_id, tid);
                     auto blob = build_blob(current_blob_id);
                     len = blob.body.size();
                     if (use_random_offset) {
@@ -467,7 +465,6 @@ public:
         EXPECT_EQ(lhs.last_modified_time, rhs.last_modified_time);
         EXPECT_EQ(lhs.available_capacity_bytes, rhs.available_capacity_bytes);
         EXPECT_EQ(lhs.total_capacity_bytes, rhs.total_capacity_bytes);
-        EXPECT_EQ(lhs.deleted_capacity_bytes, rhs.deleted_capacity_bytes);
         EXPECT_EQ(lhs.current_leader, rhs.current_leader);
     }
 

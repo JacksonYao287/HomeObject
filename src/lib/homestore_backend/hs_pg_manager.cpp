@@ -673,4 +673,58 @@ void HSHomeObject::on_create_pg_message_rollback(int64_t lsn, sisl::blob const& 
     }
 }
 
+void HSHomeObject::update_pg_meta_after_gc(const pg_id_t pg_id, const homestore::chunk_num_t move_from_chunk,
+                                           const homestore::chunk_num_t move_to_chunk,
+                                           uint64_t const& total_tombstone_blob_count) {
+    // 1 change the pg_chunkcollection in chunk selector.
+    chunk_selector()->switch_chunks_for_pg(pg_id, move_from_chunk, move_to_chunk);
+
+    // 2 update pg state
+    std::unique_lock lck(_pg_lock);
+    auto iter = _pg_map.find(pg_id);
+    // TODO:: revisit here with the considering of destroying pg
+    RELEASE_ASSERT(iter != _pg_map.end(), "can not find pg_id={} in pg_map", pg_id);
+    auto hs_pg = dynamic_cast< HS_PG* >(iter->second.get());
+
+    // TODO:hs_pg->shards_.size() will be decreased by 1 in delete_shard if gc finds a empty shard, which will be
+    // implemented later
+    hs_pg->durable_entities_update([this, &move_from_chunk, &move_to_chunk, &total_tombstone_blob_count](auto& de) {
+        // active_blob_count is updated by put/delete blob, not change it here.
+
+        de.tombstone_blob_count += total_tombstone_blob_count;
+
+        // TODO: add a pr that seal_shard should also increase total_occupied_blk_count by one.
+        auto move_from_v_chunk = chunk_selector()->get_extend_vchunk(move_from_chunk);
+        auto move_to_v_chunk = chunk_selector()->get_extend_vchunk(move_to_chunk);
+
+        auto total_occupied_blk_count_by_move_from_chunk =
+            move_from_v_chunk->get_total_blks() - move_from_v_chunk->available_blks();
+        auto total_occupied_blk_count_by_move_to_chunk =
+            move_to_v_chunk->get_total_blks() - move_to_v_chunk->available_blks();
+
+        de.total_occupied_blk_count -=
+            total_occupied_blk_count_by_move_to_chunk - total_occupied_blk_count_by_move_from_chunk;
+    });
+
+    // 3 update pg super blk
+    // TODO:: for now, when updating pchunk for a vchunk, we have to update the whole pg super blk, which will be time
+    // consuming. we can optimize this by persist a single superblk for each vchunk in the pg, so that we only need to
+    // update the vchunk superblk itself.
+    auto pg_chunks = hs_pg->pg_sb_->get_chunk_ids_mutable();
+    auto move_from_v_chunk = chunk_selector()->get_extend_vchunk(move_from_chunk);
+
+    RELEASE_ASSERT(move_from_v_chunk != nullptr, "can not find EXVchunk for chunk={}", move_from_chunk);
+    RELEASE_ASSERT(move_from_v_chunk->m_v_chunk_id != std::nullopt, "can not find vchunk for chunk={}, pg_id={}",
+                   move_from_chunk, pg_id);
+    auto v_chunk_id = move_from_v_chunk->m_v_chunk_id.value();
+
+    RELEASE_ASSERT(pg_chunks[v_chunk_id] == move_from_chunk,
+                   "vchunk_id={} chunk_id={} is not equal to move_from_chunk={} for pg={}", v_chunk_id,
+                   pg_chunks[v_chunk_id], move_from_chunk, pg_id);
+    // update the vchunk to new pchunk(move_to_chunk))
+    pg_chunks[v_chunk_id] = move_to_chunk;
+
+    hs_pg->pg_sb_.write();
+}
+
 } // namespace homeobject
