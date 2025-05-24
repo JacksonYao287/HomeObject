@@ -3,7 +3,7 @@
 TEST_F(HomeObjectFixture, BasicGC) {
     auto num_pgs = SISL_OPTIONS["num_pgs"].as< uint64_t >();
     auto num_shards_per_pg = SISL_OPTIONS["num_shards"].as< uint64_t >() / num_pgs;
-    auto num_blobs_per_shard = SISL_OPTIONS["num_blobs"].as< uint64_t >() / num_shards_per_pg;
+    auto num_blobs_per_shard = 10 * SISL_OPTIONS["num_blobs"].as< uint64_t >() / num_shards_per_pg;
     std::map< pg_id_t, std::vector< shard_id_t > > pg_shard_id_vec;
     std::map< pg_id_t, blob_id_t > pg_blob_id;
 

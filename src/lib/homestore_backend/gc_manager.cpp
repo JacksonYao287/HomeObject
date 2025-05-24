@@ -174,7 +174,8 @@ bool GCManager::is_eligible_for_gc(chunk_id_t chunk_id) {
 
     // defrag_blk_num > (GC_THRESHOLD_PERCENT/100) * total_blk_num, to avoid floating point number calculation
     // TODO: avoid overflow here.
-    return 100 * defrag_blk_num > total_blk_num * gc_garbage_rate_threshold;
+    auto eligible_for_gc = 100 * defrag_blk_num > total_blk_num * gc_garbage_rate_threshold;
+    return eligible_for_gc;
 }
 
 void GCManager::scan_chunks_for_gc() {
@@ -491,7 +492,7 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
             },
             nullptr, std::numeric_limits< uint32_t >::max(),
             [&valid_blob_indexes, &total_tombstone_blob_count](homestore::BtreeKey const& key,
-                                                       homestore::BtreeValue const& value) mutable -> bool {
+                                                               homestore::BtreeValue const& value) mutable -> bool {
                 BlobRouteValue existing_value{value};
                 if (existing_value.pbas() == HSHomeObject::tombstone_pbas) {
                     total_tombstone_blob_count++;
@@ -503,7 +504,8 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
             }};
 
         auto status = pg_index_table->remove(range_remove_req);
-        if (status != homestore::btree_status_t::success) {
+        if (status != homestore::btree_status_t::success &&
+            status != homestore::btree_status_t::not_found /*empty shard*/) {
             // TODO:: handle the error case here! if some of the tombstone is deleted, then the
             // total_tombstone_blob_count might not be updated to pg metrics.
             RELEASE_ASSERT(false, "can not range remove blobs with tombstone in pg index table , pg_id={}", pg_id);
@@ -560,7 +562,8 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
             // 1 write the shard header to move_to_chunk
             data_service.async_alloc_write(header_sgs, hints, out_blkids)
                 .thenValue([this, &hints, &move_to_chunk, &move_from_chunk, &is_emergent, &is_last_shard, &shard_id,
-                            &blk_size, &valid_blob_indexes, &data_service, header_sgs = std::move(header_sgs)](auto&& err) {
+                            &blk_size, &valid_blob_indexes, &data_service,
+                            header_sgs = std::move(header_sgs)](auto&& err) {
                     RELEASE_ASSERT(header_sgs.iovs.size() == 1, "header_sgs.iovs.size() should be 1, but not!");
                     iomanager.iobuf_free(reinterpret_cast< uint8_t* >(header_sgs.iovs[0].iov_base));
                     if (err) {
@@ -710,7 +713,8 @@ void GCManager::pdev_gc_actor::purge_reserved_chunk(chunk_id_t chunk) {
         }};
 
     auto status = m_index_table->remove(range_remove_req);
-    if (status != homestore::btree_status_t::success) {
+    if (status != homestore::btree_status_t::success &&
+        status != homestore::btree_status_t::not_found /*already empty*/) {
         // TODO:: handle the error case here!
         RELEASE_ASSERT(false, "can not clear gc index table, chunk_id={}", chunk);
     }

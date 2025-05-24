@@ -82,7 +82,7 @@ private:
     std::once_flag replica_restart_flag_;
 
     // mapping from chunk to shard list.
-    folly::ConcurrentHashMap< homestore::chunk_num_t, std::set< shard_id_t > > chunk_to_shards_map_;
+    std::unordered_map< homestore::chunk_num_t, std::set< shard_id_t > > chunk_to_shards_map_;
 
 public:
 #pragma pack(1)
@@ -840,10 +840,11 @@ public:
     recover_index_table(homestore::superblk< homestore::index_table_sb >&& sb);
     std::optional< pg_id_t > get_pg_id_with_group_id(homestore::group_id_t group_id) const;
 
-    const auto get_shards_in_chunk(homestore::chunk_num_t chunk_id) const { return chunk_to_shards_map_.at(chunk_id); }
+    const std::set< shard_id_t > get_shards_in_chunk(homestore::chunk_num_t chunk_id) const;
 
     void update_pg_meta_after_gc(const pg_id_t pg_id, const homestore::chunk_num_t move_from_chunk,
-                                 const homestore::chunk_num_t move_to_chunk, uint64_t const& total_tombstone_blob_count);
+                                 const homestore::chunk_num_t move_to_chunk,
+                                 uint64_t const& total_tombstone_blob_count);
 
     // Snapshot persistence related
     sisl::io_blob_safe get_snapshot_sb_data(homestore::group_id_t group_id);

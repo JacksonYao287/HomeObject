@@ -546,7 +546,8 @@ void HSHomeObject::add_new_shard_to_map(std::unique_ptr< HS_Shard > shard) {
                    (shard_id >> homeobject::shard_width), (shard_id & homeobject::shard_mask));
 
     const auto [it, h] = chunk_to_shards_map_.try_emplace(p_chunk_id, std::set< shard_id_t >());
-    auto per_chunk_shard_list = it->second;
+    if (h) { LOGDEBUG("chunk_id={} is not in chunk_to_shards_map, add it", p_chunk_id); }
+    auto& per_chunk_shard_list = it->second;
     const auto inserted = (per_chunk_shard_list.emplace(shard_id)).second;
     RELEASE_ASSERT(inserted, "shardID=0x{:x}, pg={}, shard=0x{:x}, duplicated shard info", shard_id,
                    (shard_id >> homeobject::shard_width), (shard_id & homeobject::shard_mask));
@@ -578,6 +579,15 @@ std::optional< homestore::chunk_num_t > HSHomeObject::get_shard_p_chunk_id(shard
     if (shard_iter == _shard_map.end()) { return std::nullopt; }
     auto hs_shard = d_cast< HS_Shard* >((*shard_iter->second).get());
     return std::make_optional< homestore::chunk_num_t >(hs_shard->sb_->p_chunk_id);
+}
+
+const std::set< shard_id_t > HSHomeObject::get_shards_in_chunk(homestore::chunk_num_t chunk_id) const {
+    const auto it = chunk_to_shards_map_.find(chunk_id);
+    if (it == chunk_to_shards_map_.cend()) {
+        LOGW("chunk_id={} not found in chunk_to_shards_map", chunk_id);
+        return {};
+    }
+    return it->second;
 }
 
 void HSHomeObject::update_shard_meta_after_gc(const homestore::chunk_num_t move_from_chunk,
