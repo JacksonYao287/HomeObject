@@ -333,7 +333,7 @@ void GCManager::pdev_gc_actor::handle_recovered_gc_task(const GCManager::gc_task
 bool GCManager::pdev_gc_actor::replace_blob_index(chunk_id_t move_from_chunk, chunk_id_t move_to_chunk,
                                                   uint8_t priority, uint64_t const& total_tombstone_blob_count) {
     // 1 get all blob index from gc index table
-    std::vector< std::pair< BlobRouteByChunkKey, BlobRouteValue > > out_vector;
+    std::vector< std::pair< BlobRouteByChunkKey, BlobRouteValue > > valid_blob_indexes;
     auto start_key = BlobRouteByChunkKey{BlobRouteByChunk(move_to_chunk, 0, 0)};
     auto end_key = BlobRouteByChunkKey{BlobRouteByChunk{move_to_chunk, std::numeric_limits< uint64_t >::max(),
                                                         std::numeric_limits< uint64_t >::max()}};
@@ -341,7 +341,7 @@ bool GCManager::pdev_gc_actor::replace_blob_index(chunk_id_t move_from_chunk, ch
         std::move(start_key), true /* inclusive */, std::move(end_key), true /* inclusive */
     }};
 
-    auto const ret = m_index_table->query(query_req, out_vector);
+    auto const ret = m_index_table->query(query_req, valid_blob_indexes);
     if (ret != homestore::btree_status_t::success) {
         // "ret != homestore::btree_status_t::has_more" is not expetced here, since we are querying all the pbas in one
         // time.
@@ -367,7 +367,7 @@ bool GCManager::pdev_gc_actor::replace_blob_index(chunk_id_t move_from_chunk, ch
     // for now we do this sequentially.
     // TODO:: concurrently update pg index table if necessary
 
-    for (const auto& [k, v] : out_vector) {
+    for (const auto& [k, v] : valid_blob_indexes) {
         BlobRouteKey index_key{BlobRoute{k.key().shard, k.key().blob}};
 
         homestore::BtreeSinglePutRequest update_req{
@@ -474,15 +474,42 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
         return false;
     }
 
-    auto pg_index_table = m_hs_home_object->get_hs_pg(shard_info.placement_group)->index_table_;
+    const auto pg_id = shard_info.placement_group;
+    auto pg_index_table = m_hs_home_object->get_hs_pg(pg_id)->index_table_;
     auto blk_size = data_service.get_blk_size();
 
     for (const auto& shard_id : shards) {
         bool is_last_shard = (shard_id == last_shard_id);
-        std::vector< std::pair< BlobRouteKey, BlobRouteValue > > out_vector;
+        std::vector< std::pair< BlobRouteKey, BlobRouteValue > > valid_blob_indexes;
         auto start_key = BlobRouteKey{BlobRoute{shard_id, std::numeric_limits< uint64_t >::min()}};
         auto end_key = BlobRouteKey{BlobRoute{shard_id, std::numeric_limits< uint64_t >::max()}};
 
+        // delete all the tombstone keys in pg index table and get the valid blob keys
+        homestore::BtreeRangeRemoveRequest< BlobRouteKey > range_remove_req{
+            homestore::BtreeKeyRange< BlobRouteKey >{
+                std::move(start_key), true /* inclusive */, std::move(end_key), true /* inclusive */
+            },
+            nullptr, std::numeric_limits< uint32_t >::max(),
+            [&valid_blob_indexes, &total_tombstone_blob_count](homestore::BtreeKey const& key,
+                                                       homestore::BtreeValue const& value) mutable -> bool {
+                BlobRouteValue existing_value{value};
+                if (existing_value.pbas() == HSHomeObject::tombstone_pbas) {
+                    total_tombstone_blob_count++;
+                    // delete tombstone key value
+                    return true;
+                }
+                valid_blob_indexes.emplace_back(key, value);
+                return false;
+            }};
+
+        auto status = pg_index_table->remove(range_remove_req);
+        if (status != homestore::btree_status_t::success) {
+            // TODO:: handle the error case here! if some of the tombstone is deleted, then the
+            // total_tombstone_blob_count might not be updated to pg metrics.
+            RELEASE_ASSERT(false, "can not range remove blobs with tombstone in pg index table , pg_id={}", pg_id);
+        }
+
+#if 0
         homestore::BtreeQueryRequest< BlobRouteKey > query_req{
             homestore::BtreeKeyRange< BlobRouteKey >{std::move(start_key), true /* inclusive */, std::move(end_key),
                                                      true /* inclusive */},
@@ -498,13 +525,14 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
                 return true;
             }};
 
-        auto const status = pg_index_table->query(query_req, out_vector);
+        auto const status = pg_index_table->query(query_req, valid_blob_indexes);
         if (status != homestore::btree_status_t::success && status != homestore::btree_status_t::has_more) {
             LOGERROR("Failed to query blobs in index table for status={} shard={}", status, shard_id);
             return false;
         }
+#endif
 
-        if (out_vector.empty()) {
+        if (valid_blob_indexes.empty()) {
             LOGINFO("empty shard found in move_from_chunk, chunk_id={}, shard_id={}", move_from_chunk, shard_id);
             // TODO::send a delete shard request to raft channel. there is a case that when we are doing gc, the
             // shard becomes empty, need to handle this case
@@ -532,7 +560,7 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
             // 1 write the shard header to move_to_chunk
             data_service.async_alloc_write(header_sgs, hints, out_blkids)
                 .thenValue([this, &hints, &move_to_chunk, &move_from_chunk, &is_emergent, &is_last_shard, &shard_id,
-                            &blk_size, &out_vector, &data_service, header_sgs = std::move(header_sgs)](auto&& err) {
+                            &blk_size, &valid_blob_indexes, &data_service, header_sgs = std::move(header_sgs)](auto&& err) {
                     RELEASE_ASSERT(header_sgs.iovs.size() == 1, "header_sgs.iovs.size() should be 1, but not!");
                     iomanager.iobuf_free(reinterpret_cast< uint8_t* >(header_sgs.iovs[0].iov_base));
                     if (err) {
@@ -544,7 +572,7 @@ bool GCManager::pdev_gc_actor::copy_valid_data(chunk_id_t move_from_chunk, chunk
                     std::vector< folly::Future< bool > > futs;
 
                     // 2 copy all the valid blob in the shard from move_from_chunk to move_to_chunk
-                    for (const auto& [k, v] : out_vector) {
+                    for (const auto& [k, v] : valid_blob_indexes) {
                         // k is shard_id + blob_id, v is multiblk id
                         auto pba = v.pbas();
                         auto total_size = pba.blk_count() * blk_size;
@@ -675,10 +703,12 @@ void GCManager::pdev_gc_actor::purge_reserved_chunk(chunk_id_t chunk) {
     auto start_key = BlobRouteByChunkKey{BlobRouteByChunk(chunk, 0, 0)};
     auto end_key = BlobRouteByChunkKey{
         BlobRouteByChunk{chunk, std::numeric_limits< uint64_t >::max(), std::numeric_limits< uint64_t >::max()}};
+
     homestore::BtreeRangeRemoveRequest< BlobRouteByChunkKey > range_remove_req{
         homestore::BtreeKeyRange< BlobRouteByChunkKey >{
             std::move(start_key), true /* inclusive */, std::move(end_key), true /* inclusive */
         }};
+
     auto status = m_index_table->remove(range_remove_req);
     if (status != homestore::btree_status_t::success) {
         // TODO:: handle the error case here!
