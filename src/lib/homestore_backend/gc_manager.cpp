@@ -164,7 +164,7 @@ bool GCManager::is_eligible_for_gc(chunk_id_t chunk_id) {
     const auto defrag_blk_num = chunk->get_defrag_nblks();
 
     if (!defrag_blk_num) {
-        LOGDEBUG("chunk_id={} has no defrag blk, skip gc", chunk_id);
+        // LOGDEBUG("chunk_id={} has no defrag blk, skip gc", chunk_id);
         return false;
     }
 

@@ -601,6 +601,14 @@ public:
         // TODO: add logic for check and retry of leader change if necessary
     }
 
+    void run_on_pg_follower(pg_id_t pg_id, auto&& lambda) {
+        PGStats pg_stats;
+        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
+        if (!res) return;
+        if (g_helper->my_replica_id() != pg_stats.leader_id) { lambda(); }
+        // TODO: add logic for check and retry of leader change if necessary
+    }
+
     peer_id_t get_leader_id(pg_id_t pg_id) {
         if (!am_i_in_pg(pg_id)) return uuids::nil_uuid();
         while (true) {
