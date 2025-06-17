@@ -164,7 +164,7 @@ bool GCManager::is_eligible_for_gc(chunk_id_t chunk_id) {
     const auto defrag_blk_num = chunk->get_defrag_nblks();
 
     if (!defrag_blk_num) {
-        // LOGDEBUG("chunk_id={} has no defrag blk, skip gc", chunk_id);
+        LOGDEBUG("chunk_id={} has no defrag blk, skip gc", chunk_id);
         return false;
     }
 
@@ -425,19 +425,14 @@ bool GCManager::pdev_gc_actor::replace_blob_index(
             [&pg_id, &shard, &blob](homestore::BtreeKey const& key, homestore::BtreeValue const& value_in_btree,
                                     homestore::BtreeValue const& new_value) -> homestore::put_filter_decision {
                 BlobRouteValue existing_value{value_in_btree};
-                BlobRouteValue new_pba_value{new_value};
                 if (existing_value.pbas() == HSHomeObject::tombstone_pbas) {
                     LOGDEBUG(
                         "remove tombstone when updating pg index after data copy , pg_id={}, shard_id={}, blob_id={}",
                         pg_id, shard, blob);
-
+                    BlobRouteValue new_pba_value{new_value};
                     homestore::data_service().async_free_blk(new_pba_value.pbas());
                     return homestore::put_filter_decision::remove;
                 }
-
-                LOGDEBUG("replace pg={}, shard_id={}, blob_id={} from old_pba={} to new_pba={}", pg_id, shard, blob,
-                         existing_value.pbas().to_string(), new_pba_value.pbas().to_string());
-
                 return homestore::put_filter_decision::replace;
             }};
 

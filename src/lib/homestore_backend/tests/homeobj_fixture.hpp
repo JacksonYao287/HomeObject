@@ -237,7 +237,7 @@ public:
         }
     }
 
-    // TODO:: make this run in parallel
+    // TODO:make this run in parallel
     std::map< shard_id_t, std::map< blob_id_t, uint64_t > >
     put_blobs(std::map< pg_id_t, std::vector< shard_id_t > > const& pg_shard_id_vec, uint64_t const num_blobs_per_shard,
               std::map< pg_id_t, blob_id_t >& pg_blob_id, bool need_sync_before_start = true) {
@@ -598,14 +598,6 @@ public:
         auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
         if (!res) return;
         if (g_helper->my_replica_id() == pg_stats.leader_id) { lambda(); }
-        // TODO: add logic for check and retry of leader change if necessary
-    }
-
-    void run_on_pg_follower(pg_id_t pg_id, auto&& lambda) {
-        PGStats pg_stats;
-        auto res = _obj_inst->pg_manager()->get_stats(pg_id, pg_stats);
-        if (!res) return;
-        if (g_helper->my_replica_id() != pg_stats.leader_id) { lambda(); }
         // TODO: add logic for check and retry of leader change if necessary
     }
 
