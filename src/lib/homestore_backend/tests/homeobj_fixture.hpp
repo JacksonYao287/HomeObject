@@ -237,7 +237,7 @@ public:
         }
     }
 
-    // TODO:make this run in parallel
+    // TODO:: make this run in parallel
     std::map< shard_id_t, std::map< blob_id_t, uint64_t > >
     put_blobs(std::map< pg_id_t, std::vector< shard_id_t > > const& pg_shard_id_vec, uint64_t const num_blobs_per_shard,
               std::map< pg_id_t, blob_id_t >& pg_blob_id, bool need_sync_before_start = true) {

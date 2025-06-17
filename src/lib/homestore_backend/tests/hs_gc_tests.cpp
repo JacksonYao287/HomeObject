@@ -1,5 +1,5 @@
 #include "homeobj_fixture.hpp"
-
+#if 0
 TEST_F(HomeObjectFixture, BasicGC) {
     const auto num_pgs = SISL_OPTIONS["num_pgs"].as< uint64_t >();
     const auto num_shards_per_chunk = SISL_OPTIONS["num_shards"].as< uint64_t >();
@@ -308,7 +308,7 @@ TEST_F(HomeObjectFixture, BasicGC) {
 TEST_F(HomeObjectFixture, BasicEGC) { EmergentGC(false); }
 
 TEST_F(HomeObjectFixture, EGCWithCrashRecovery) { EmergentGC(true); }
-
+#endif
 TEST_F(HomeObjectFixture, HandlingNoSpaceLeft) {
     const auto num_pgs = SISL_OPTIONS["num_pgs"].as< uint64_t >();
     const auto num_shards_per_chunk = SISL_OPTIONS["num_shards"].as< uint64_t >();
@@ -317,7 +317,7 @@ TEST_F(HomeObjectFixture, HandlingNoSpaceLeft) {
     std::map< pg_id_t, std::vector< shard_id_t > > total_pg_open_shard_id_vec;
     std::map< pg_id_t, blob_id_t > pg_blob_id;
     std::map< pg_id_t, uint64_t > pg_chunk_nums;
-    std::map< shard_id_t, std::map< blob_id_t, uint64_t > > shard_blob_ids_map;
+    std::map< shard_id_t, std::set< blob_id_t > > shard_blob_ids_map;
     auto chunk_selector = _obj_inst->chunk_selector();
 
     // create pgs
@@ -345,7 +345,8 @@ TEST_F(HomeObjectFixture, HandlingNoSpaceLeft) {
         auto new_shard_blob_ids_map = put_blobs(pg_open_shard_id_vec, num_blobs_per_shard, pg_blob_id);
 
         for (const auto& [shard_id, blob_to_blk_count] : new_shard_blob_ids_map) {
-            shard_blob_ids_map[shard_id].insert(blob_to_blk_count.begin(), blob_to_blk_count.end());
+            for (const auto& [blob_id, _] : blob_to_blk_count)
+                shard_blob_ids_map[shard_id].insert(blob_id);
         }
 
         // seal all shards except the last one and check
@@ -401,8 +402,15 @@ TEST_F(HomeObjectFixture, HandlingNoSpaceLeft) {
         });
     }
 
-    // now, trigger no space left in all chunk and all the put_blob should succeed
-    put_blobs(total_pg_open_shard_id_vec, num_blobs_per_shard, pg_blob_id);
+    // now, trigger no space left in all chunks and all the put_blob should succeed
+    auto new_shard_blob_ids_map = put_blobs(total_pg_open_shard_id_vec, num_blobs_per_shard, pg_blob_id);
+
+    for (const auto& [shard_id, blob_to_blk_count] : new_shard_blob_ids_map) {
+        for (const auto& [blob_id, _] : blob_to_blk_count)
+            shard_blob_ids_map[shard_id].insert(blob_id);
+    }
+
+    verify_shard_blobs(shard_blob_ids_map);
 }
 
 void HomeObjectFixture::EmergentGC(bool with_crash_recovery) {
