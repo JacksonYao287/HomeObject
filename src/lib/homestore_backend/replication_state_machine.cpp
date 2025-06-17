@@ -258,7 +258,6 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
     case ReplicationMessageType::PUT_BLOB_MSG:
         return home_object_->blob_put_get_blk_alloc_hints(header, hs_ctx);
 
-    case ReplicationMessageType::DEL_BLOB_MSG:
     default:
         break;
     }
