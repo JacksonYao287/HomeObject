@@ -258,9 +258,10 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
     case ReplicationMessageType::PUT_BLOB_MSG:
         return home_object_->blob_put_get_blk_alloc_hints(header, hs_ctx);
 
-    case ReplicationMessageType::DEL_BLOB_MSG:
-    default:
+    default: {
+        LOGW("not support msg type for {} in get_blk_alloc_hints", msg_header->msg_type);
         break;
+    }
     }
 
     return homestore::blk_alloc_hints();
@@ -675,9 +676,9 @@ folly::Future< std::error_code > ReplicationStateMachine::on_fetch_data(const in
                 // io error
                 if (err) throw std::system_error(err);
 
-            // folly future has no machenism to bypass the later thenValue in the then value chain. so for all the
-            // case that no need to schedule the later async_read, we throw a system_error with no error code to
-            // bypass the next thenValue.
+                // folly future has no machenism to bypass the later thenValue in the then value chain. so for all the
+                // case that no need to schedule the later async_read, we throw a system_error with no error code to
+                // bypass the next thenValue.
 #ifdef _PRERELEASE
                 if (iomgr_flip::instance()->test_flip("local_blk_data_invalid")) {
                     LOGI("Simulating forcing to read by indextable");
@@ -863,7 +864,62 @@ void HSHomeObject::on_snp_ctx_meta_blk_recover_completed(bool success) {
     LOGI("Snapshot context meta blk recover completed");
 }
 
-void ReplicationStateMachine::on_no_space_left(homestore::repl_lsn_t lsn, homestore::chunk_num_t chunk_id) {
+void ReplicationStateMachine::on_no_space_left(homestore::repl_lsn_t lsn, sisl::blob const& header) {
+    homestore::chunk_num_t chunk_id{0};
+    const ReplicationMessageHeader* msg_header = r_cast< const ReplicationMessageHeader* >(header.cbytes());
+
+    if (sisl_unlikely(msg_header->corrupted())) {
+        LOGE("shardID=0x{:x}, pg={}, shard=0x{:x}, replication message header is corrupted with crc error when "
+             "handling on_no_space_left",
+             tid, msg_header->shard_id, (msg_header->shard_id >> homeobject::shard_width),
+             (msg_header->shard_id & homeobject::shard_mask));
+    } else {
+        const pg_id_t pg_id = msg_header->pg_id;
+
+        switch (msg_header->msg_type) {
+        // this case is only that no_space_left happens when writting shard header block on follower side.
+        case ReplicationMessageType::CREATE_SHARD_MSG: {
+            if (!home_object_->pg_exists(pg_id)) {
+                LOGW("shardID=0x{:x}, shard=0x{:x}, can not find pg={} when handling on_no_space_left",
+                     msg_header->shard_id, (msg_header->shard_id & homeobject::shard_mask), pg_id);
+            }
+            auto v_chunkID = home_object_->resolve_v_chunk_id_from_msg(header);
+            if (!v_chunkID.has_value()) {
+                LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, can not resolve v_chunk_id from msg", msg_header->shard_id,
+                     pg_id, (msg_header->shard_id & homeobject::shard_mask));
+            } else {
+                chunk_id = home_object_->chunk_selector()->get_pg_vchunk(pg_id, v_chunkID.value())->get_chunk_id();
+            }
+
+            break;
+        }
+
+        case ReplicationMessageType::SEAL_SHARD_MSG:
+        case ReplicationMessageType::PUT_BLOB_MSG: {
+            auto p_chunkID = home_object_->get_shard_p_chunk_id(msg_header->shard_id);
+            if (!p_chunkID.has_value()) {
+                LOGW("shardID=0x{:x}, pg={}, shard=0x{:x}, shard does not exist when handling on_no_space_left, "
+                     "underlying "
+                     "engine will retry this later",
+                     msg_header->shard_id, pg_id, (msg_header->shard_id & homeobject::shard_mask));
+            } else {
+                chunk_id = p_chunkID.value();
+            }
+
+            break;
+        }
+
+        default: {
+            LOGW("not support msg type for {} in handling on_no_space_left", msg_header->msg_type);
+        }
+        }
+    }
+
+    if (0 == chunk_id) {
+        LOGW("can not get a valid chunk_id, skip handling on_no_space_left for lsn={}", lsn);
+        return;
+    }
+
     LOGD("got no_space_left error at lsn={}, chunk_id={}", lsn, chunk_id);
 
     const auto [target_lsn, error_chunk_id] = get_no_space_left_error_info();
@@ -909,15 +965,26 @@ void ReplicationStateMachine::handle_no_space_left(homestore::repl_lsn_t lsn, ho
     // 2 clear all the in-memeory rreqs that alrady allocated blocks on the chunk.
     repl_dev()->clear_chunk_req(chunk_id);
 
-    // 3 handling this error in the homeobject, do what ever you want.
-    // for homeobject, we will submit an emergent gc task to gc manager
-    // gc->summit_emergent_gc_task().wait();
-
-    //  4 start accepting new requests again.
-    repl_dev()->resume_accepting_reqs();
-
-    // TODO:: add step4 and reset_no_space_left_error_info into the thenValue of the returned future of
-    // summit_emergent_gc_task() , so that it will not block in handle_no_space_left
+    // 3 handling this error. for homeobject, we will submit an emergent gc task and wait for the completion.
+    auto gc_mgr = home_object_->gc_manager();
+    if (gc_mgr->is_started()) {
+        // FIXME:: there is a very corner case that when reaching this line, gc_mgr is stopped. fix this later.
+        gc_mgr->submit_gc_task(task_priority::emergent, chunk_id)
+            .via(&folly::InlineExecutor::instance())
+            .thenValue([this, lsn, chunk_id](auto&& res) {
+                if (!res) {
+                    RELEASE_ASSERT(false, "failed to emergent gc chunk_id={} , lsn={} - fatal error, aborting",
+                                   chunk_id, lsn);
+                }
+                LOGD("successfully handle no_space_left error for chunk_id={} , lsn={}", chunk_id, lsn);
+                // start accepting new requests again.
+                repl_dev()->resume_accepting_reqs();
+            });
+    } else {
+        // start accepting new requests again.
+        LOGD("gc manager is not started, skip handle no_space_left for chunk={}, lsn={}", chunk_id, lsn);
+        repl_dev()->resume_accepting_reqs();
+    }
 }
 
 } // namespace homeobject
