@@ -90,6 +90,9 @@ std::pair< bool, homestore::btree_status_t > HSHomeObject::add_to_index_table(sh
             return {true, status};
         }
         LOGE("Failed to put to index table error {}", status);
+    } else {
+        LOGD("Successfully added blob to index table, shard_id={}, blob_id={}, pbas={}", blob_info.shard_id,
+             blob_info.blob_id, blob_info.pbas.to_string());
     }
 
     return {false, status};

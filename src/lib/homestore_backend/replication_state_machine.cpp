@@ -258,7 +258,6 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
     case ReplicationMessageType::PUT_BLOB_MSG:
         return home_object_->blob_put_get_blk_alloc_hints(header, hs_ctx);
 
-    case ReplicationMessageType::DEL_BLOB_MSG:
     default:
         break;
     }
@@ -675,9 +674,9 @@ folly::Future< std::error_code > ReplicationStateMachine::on_fetch_data(const in
                 // io error
                 if (err) throw std::system_error(err);
 
-            // folly future has no machenism to bypass the later thenValue in the then value chain. so for all the
-            // case that no need to schedule the later async_read, we throw a system_error with no error code to
-            // bypass the next thenValue.
+                // folly future has no machenism to bypass the later thenValue in the then value chain. so for all the
+                // case that no need to schedule the later async_read, we throw a system_error with no error code to
+                // bypass the next thenValue.
 #ifdef _PRERELEASE
                 if (iomgr_flip::instance()->test_flip("local_blk_data_invalid")) {
                     LOGI("Simulating forcing to read by indextable");
@@ -917,8 +916,7 @@ void ReplicationStateMachine::handle_no_space_left(homestore::repl_lsn_t lsn, ho
             .via(&folly::InlineExecutor::instance())
             .thenValue([this, lsn, chunk_id](auto&& res) {
                 if (!res) {
-                    RELEASE_ASSERT(false,
-                                   "failed to submit emergent gc task for chunk_id={} , lsn={} - fatal error, aborting",
+                    RELEASE_ASSERT(false, "failed to emergent gc chunk_id={} , lsn={} - fatal error, aborting",
                                    chunk_id, lsn);
                 }
                 LOGD("successfully handle no_space_left error for chunk_id={} , lsn={}", chunk_id, lsn);
