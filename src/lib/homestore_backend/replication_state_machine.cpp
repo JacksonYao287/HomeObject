@@ -267,15 +267,15 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
     return homestore::blk_alloc_hints();
 }
 
-void ReplicationStateMachine::on_start_replace_member(const homestore::replica_member_info& member_out,
+void ReplicationStateMachine::on_start_replace_member(const uuid_t& task_id, const homestore::replica_member_info& member_out,
                                                       const homestore::replica_member_info& member_in, trace_id_t tid) {
-    home_object_->on_pg_start_replace_member(repl_dev()->group_id(), member_out, member_in, tid);
+    home_object_->on_pg_start_replace_member(repl_dev()->group_id(), task_id, member_out, member_in, tid);
 }
 
-void ReplicationStateMachine::on_complete_replace_member(const homestore::replica_member_info& member_out,
+void ReplicationStateMachine::on_complete_replace_member(const uuid_t& task_id, const homestore::replica_member_info& member_out,
                                                          const homestore::replica_member_info& member_in,
                                                          trace_id_t tid) {
-    home_object_->on_pg_complete_replace_member(repl_dev()->group_id(), member_out, member_in, tid);
+    home_object_->on_pg_complete_replace_member(repl_dev()->group_id(), task_id, member_out, member_in, tid);
 }
 
 void ReplicationStateMachine::on_destroy(const homestore::group_id_t& group_id) {
@@ -435,6 +435,8 @@ void ReplicationStateMachine::write_snapshot_obj(std::shared_ptr< homestore::sna
     if (snp_obj->is_last_obj) {
         LOGD("Write snapshot reached is_last_obj true {}", log_suffix);
         set_snapshot_context(context); // Update the snapshot context in case apply_snapshot is not called
+        auto hs_pg = home_object_->get_hs_pg(m_snp_rcv_handler->get_context_pg_id());
+        hs_pg->pg_state_.clear_state(PGStateMask::BASELINE_RESYNC);
         return;
     }
 
