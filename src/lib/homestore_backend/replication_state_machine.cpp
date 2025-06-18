@@ -267,12 +267,14 @@ ReplicationStateMachine::get_blk_alloc_hints(sisl::blob const& header, uint32_t 
     return homestore::blk_alloc_hints();
 }
 
-void ReplicationStateMachine::on_start_replace_member(const uuid_t& task_id, const homestore::replica_member_info& member_out,
+void ReplicationStateMachine::on_start_replace_member(const uuid_t& task_id,
+                                                      const homestore::replica_member_info& member_out,
                                                       const homestore::replica_member_info& member_in, trace_id_t tid) {
     home_object_->on_pg_start_replace_member(repl_dev()->group_id(), task_id, member_out, member_in, tid);
 }
 
-void ReplicationStateMachine::on_complete_replace_member(const uuid_t& task_id, const homestore::replica_member_info& member_out,
+void ReplicationStateMachine::on_complete_replace_member(const uuid_t& task_id,
+                                                         const homestore::replica_member_info& member_out,
                                                          const homestore::replica_member_info& member_in,
                                                          trace_id_t tid) {
     home_object_->on_pg_complete_replace_member(repl_dev()->group_id(), task_id, member_out, member_in, tid);
@@ -873,7 +875,7 @@ void ReplicationStateMachine::on_no_space_left(homestore::repl_lsn_t lsn, sisl::
     if (sisl_unlikely(msg_header->corrupted())) {
         LOGE("shardID=0x{:x}, pg={}, shard=0x{:x}, replication message header is corrupted with crc error when "
              "handling on_no_space_left",
-             tid, msg_header->shard_id, (msg_header->shard_id >> homeobject::shard_width),
+             msg_header->shard_id, (msg_header->shard_id >> homeobject::shard_width),
              (msg_header->shard_id & homeobject::shard_mask));
     } else {
         const pg_id_t pg_id = msg_header->pg_id;

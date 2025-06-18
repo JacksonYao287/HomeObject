@@ -399,7 +399,7 @@ TEST_F(HomeObjectFixture, BasicEGC) {
     auto gc_mgr = _obj_inst->gc_manager();
 
     // trigger egc for all chunks
-    std::vector< folly::SemiFuture< bool > > futs;
+    
     for (const auto& [pg_id, chunk_num] : pg_chunk_nums) {
         const auto pg_chunks = chunk_selector->get_pg_chunks(pg_id);
         for (uint64_t i{0}; i < chunk_num; i++) {

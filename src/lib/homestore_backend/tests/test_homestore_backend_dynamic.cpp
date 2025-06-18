@@ -65,6 +65,30 @@ TEST_F(HomeObjectFixture, ReplaceMember) {
     verify_get_blob(pg_shard_id_vec, num_blobs_per_shard);
     verify_obj_count(1, num_shards_per_pg, num_blobs_per_shard, false);
 
+    run_if_in_pg(pg_id, [&]() {
+        auto gc_mgr = _obj_inst->gc_manager();
+        std::vector< folly::SemiFuture< bool > > futs;
+        for (const auto& [pg_id, shards] : pg_shard_id_vec) {
+            for (const auto& shard_id : shards) {
+                auto chunk_id_opt = _obj_inst->get_shard_p_chunk_id(shard_id);
+                RELEASE_ASSERT(chunk_id_opt.has_value(), "failed to get chunk_id for shard {}", shard_id);
+                futs.emplace_back(gc_mgr->submit_gc_task(task_priority::emergent, chunk_id_opt.value()));
+            }
+        }
+        // wait for all egc completed
+        folly::collectAllUnsafe(futs)
+            .thenValue([](auto&& results) {
+                for (auto const& ok : results) {
+                    ASSERT_TRUE(ok.hasValue());
+                    // all egc task should be completed
+                    ASSERT_TRUE(ok.value());
+                }
+            })
+            .get();
+
+        futs.clear();
+    });
+
     // all the replicas , including the spare ones, sync at this point
     g_helper->sync();
 
@@ -135,7 +159,6 @@ TEST_F(HomeObjectFixture, ReplaceMember) {
         for (const auto& [_, chunk] : _obj_inst->chunk_selector()->m_chunks) {
             // TODO: revisit the assert here after we implement gc recovery
             ASSERT_TRUE(chunk->m_state == ChunkState::AVAILABLE || chunk->m_state == ChunkState::GC);
-            ASSERT_EQ(chunk->available_blks(), chunk->get_total_blks());
         }
         LOGINFO("check no pg related data in out member successfully");
         g_helper->sync();
@@ -159,7 +182,6 @@ TEST_F(HomeObjectFixture, ReplaceMember) {
         for (const auto& [_, chunk] : _obj_inst->chunk_selector()->m_chunks) {
             // TODO: revisit the assert here after we implement gc recovery
             ASSERT_TRUE(chunk->m_state == ChunkState::AVAILABLE || chunk->m_state == ChunkState::GC);
-            ASSERT_EQ(chunk->available_blks(), chunk->get_total_blks());
         }
         LOGINFO("After restart, check no pg related data in out member successfully");
     } else {

@@ -118,6 +118,7 @@ void GCManager::stop() {
 }
 
 folly::SemiFuture< bool > GCManager::submit_gc_task(task_priority priority, chunk_id_t chunk_id) {
+    if (!is_started()) return folly::makeFuture< bool >(false);
     auto pdev_id = m_chunk_selector->get_extend_vchunk(chunk_id)->get_pdev_id();
     auto it = m_pdev_gc_actors.find(pdev_id);
     if (it == m_pdev_gc_actors.end()) {
@@ -155,10 +156,7 @@ bool GCManager::is_eligible_for_gc(chunk_id_t chunk_id) {
 
     const auto defrag_blk_num = chunk->get_defrag_nblks();
 
-    if (!defrag_blk_num) {
-        LOGDEBUG("chunk_id={} has no defrag blk, skip gc", chunk_id);
-        return false;
-    }
+    if (!defrag_blk_num) { return false; }
 
     // 1 if the chunk state is inuse, it is occupied by a open shard, so it can not be selected and we don't need gc it.
     // 2 if the chunk state is gc, it means this chunk is being gc, or this is a reserved chunk, so we don't need gc it.
@@ -944,6 +942,8 @@ bool GCManager::RateLimiter::allowRequest(uint64_t count) {
     }
     return false;
 }
+
+bool GCManager::is_started() { return m_gc_timer_hdl != iomgr::null_timer_handle; }
 
 void GCManager::RateLimiter::refillTokens() {
     auto now = std::chrono::steady_clock::now();

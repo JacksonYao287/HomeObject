@@ -173,6 +173,7 @@ public:
 
     void start();
     void stop();
+    bool is_started();
 
     void scan_chunks_for_gc();
 
