@@ -903,9 +903,38 @@ bool GCManager::pdev_gc_actor::purge_reserved_chunk(chunk_id_t chunk) {
                    "chunk_id={} is a reserved chunk, expected to have a GC state, but actuall state is {} ", chunk,
                    vchunk->m_state);
 
-    LOGDEBUG("reset chunk={} before using it for gc", vchunk->get_chunk_id());
+    LOGDEBUG("reset chunk = {:x} before using it for gc", vchunk->get_chunk_id());
     vchunk->reset(); // reset the chunk to make sure it is empty
+    auto print_keys = [this](const std::string& preamble = "") {
+        using KeyType = homeobject::BlobRouteByChunkKey;
+        using ValueType = homeobject::BlobRouteValue;
+        auto print_key_range = [](const std::vector<std::pair<KeyType, ValueType>>& kvs) -> std::string {
+            std::string str;
+            if (kvs.size()==0){
+                fmt::format_to(std::back_inserter(str), "[empty]");
+                return str;
+            }
+            uint16_t cur_chunk = kvs[0].first.key().chunk - 1;
+            uint32_t start=0;
+            for (uint32_t i{0}; i < kvs.size(); ++i) {
+                auto cur_key= kvs[i].first.key();
+                std::string shardst = fmt::format("{:x}:{:x}",(cur_key.shard >> homeobject::shard_width), (cur_key.shard & homeobject::shard_mask));
+                if(cur_key.chunk == cur_chunk){
+                    fmt::format_to(std::back_inserter(str), "{}:{:x},", shardst, cur_key.blob);
+                }else {
+                    start = i;
+                    cur_chunk= cur_key.chunk;
+                    fmt::format_to(std::back_inserter(str), "{} chunk = {:x}, {{{}:{:x}, ", start == 0 ? "" : "}", cur_key.chunk, shardst, cur_key.blob);
+                }
+            }
+            fmt::format_to(std::back_inserter(str),"}}");
+            return str;
+        };
 
+        LOGERROR("{}{}", preamble.empty() ? "" : preamble + ":\n", this->m_index_table->to_custom_string(print_key_range));
+    };
+
+    print_keys(fmt::format("\n\n\nbefore purging reserved chunk = {:x} in gc index table", vchunk->get_chunk_id()));
     // clear all the entries of this chunk in the gc index table
     auto start_key = BlobRouteByChunkKey{BlobRouteByChunk(chunk, 0, 0)};
     auto end_key = BlobRouteByChunkKey{
@@ -915,13 +944,16 @@ bool GCManager::pdev_gc_actor::purge_reserved_chunk(chunk_id_t chunk) {
         homestore::BtreeKeyRange< BlobRouteByChunkKey >{
             start_key, true /* inclusive */, end_key, true /* inclusive */
         }};
+    range_remove_req.enable_route_tracing();
 
+    //m_index_table->dump_tree_to_file("t1");
     auto status = m_index_table->remove(range_remove_req);
     if (status != homestore::btree_status_t::success &&
         status != homestore::btree_status_t::not_found /*already empty*/) {
         LOGWARN("fail to purge gc index for chunk={}", chunk);
         return false;
     }
+    print_keys(fmt::format("after pruning chunk = {:x} route :{}" ,vchunk->get_chunk_id(), range_remove_req.route_string()));
 
     // after range_remove, we check again to make sure there is not any entry in the gc index table for this chunk
     homestore::BtreeQueryRequest< BlobRouteByChunkKey > query_req{homestore::BtreeKeyRange< BlobRouteByChunkKey >{
@@ -936,7 +968,6 @@ bool GCManager::pdev_gc_actor::purge_reserved_chunk(chunk_id_t chunk) {
                  status);
         return false;
     }
-
     if (!valid_blob_indexes.empty()) {
         LOGERROR("gc index table is not empty for chunk={} after purging, valid_blob_indexes.size={}", chunk,
                  valid_blob_indexes.size());

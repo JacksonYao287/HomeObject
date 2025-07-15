@@ -121,6 +121,7 @@ DevType HSHomeObject::get_device_type(string const& devname) {
 }
 
 void HSHomeObject::init_homestore() {
+  //  std::this_thread::sleep_for(std::chrono::seconds{20});
     auto app = _application.lock();
     RELEASE_ASSERT(app, "HomeObjectApplication lifetime unexpected!");
 

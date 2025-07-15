@@ -118,9 +118,9 @@ public:
     static uint32_t get_fixed_size() { return homestore::MultiBlkId::expected_serialized_size(1 /* num_pieces */); }
 
     void deserialize(const sisl::blob& b, bool copy) override { pbas_.deserialize(b, copy); }
-    std::string to_string() const override { return fmt::format("{}", pbas_.to_string()); }
+    std::string to_string() const override { return fmt::format("{}", pbas_.to_integer()); }
     friend std::ostream& operator<<(std::ostream& os, const BlobRouteValue& v) {
-        os << v.pbas().to_string();
+        os << v.pbas().to_integer();
         return os;
     }
 
