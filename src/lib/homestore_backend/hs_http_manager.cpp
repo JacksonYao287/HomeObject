@@ -48,7 +48,11 @@ HttpManager::HttpManager(HSHomeObject& ho) : ho_(ho) {
         {Pistache::Http::Method::Get, "/api/v1/chunk/dump",
          Pistache::Rest::Routes::bind(&HttpManager::dump_chunk, this)},
         {Pistache::Http::Method::Get, "/api/v1/shard/dump",
-         Pistache::Rest::Routes::bind(&HttpManager::dump_shard, this)}};
+         Pistache::Rest::Routes::bind(&HttpManager::dump_shard, this)},
+        {Pistache::Http::Method::Post, "/api/v1/trigger_gc",
+         Pistache::Rest::Routes::bind(&HttpManager::trigger_gc, this)},
+        {Pistache::Http::Method::Get, "/api/v1/gc_job_status",
+         Pistache::Rest::Routes::bind(&HttpManager::get_gc_job_status, this)}};
 
     auto http_server = ioenvironment.get_http_server();
     if (!http_server) {
@@ -237,6 +241,301 @@ void HttpManager::dump_shard(const Pistache::Rest::Request& request, Pistache::H
         j["blobs"].push_back(blob_json);
     }
     response.send(Pistache::Http::Code::Ok, j.dump());
+}
+
+void HttpManager::trigger_gc(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response) {
+    const auto chunk_id_param = request.query().get("chunk_id");
+
+    auto gc_mgr = ho_.gc_manager();
+    if (!gc_mgr) {
+        response.send(Pistache::Http::Code::Internal_Server_Error, "GC manager not available");
+        return;
+    }
+
+    auto chunk_selector = ho_.chunk_selector();
+    if (!chunk_selector) {
+        response.send(Pistache::Http::Code::Internal_Server_Error, "Chunk selector not available");
+        return;
+    }
+
+    std::string job_id = generate_job_id();
+    nlohmann::json result;
+
+    if (!chunk_id_param || chunk_id_param.value().empty()) {
+        LOGINFO("Received trigger_gc request for all chunks, job_id={}", job_id);
+
+        auto job_info = std::make_shared< GCJobInfo >(job_id);
+        {
+            std::lock_guard< std::mutex > lock(gc_job_mutex_);
+            // Check if there is already an active GC job
+            if (current_gc_job_ &&
+                (current_gc_job_->status == GCJobStatus::PENDING || current_gc_job_->status == GCJobStatus::RUNNING)) {
+                result["error"] = "A GC job is already in progress";
+                result["active_job_id"] = current_gc_job_->job_id;
+                result["active_job_status"] = (current_gc_job_->status == GCJobStatus::PENDING) ? "pending" : "running";
+                response.send(Pistache::Http::Code::Conflict, result.dump());
+                return;
+            }
+
+            // Create new job and set as current (replacing any completed job)
+            current_gc_job_ = job_info;
+        }
+
+        iomanager.run_on_forget(
+            iomgr::reactor_regex::random_worker, [this, gc_mgr, chunk_selector, job_id, job_info]() {
+                job_info->status = GCJobStatus::RUNNING;
+                job_info->updated_at = std::chrono::system_clock::now();
+
+                uint32_t total_chunks = 0;
+                uint32_t success_count = 0;
+                uint32_t failed_count = 0;
+
+                // 1. Stop the GC scan timer to prevent automatic GC tasks
+                LOGINFO("GC job {} stopping GC scan timer", job_id);
+                gc_mgr->stop_gc_scan_timer();
+
+                // 2. Get all PG IDs first
+                std::vector< pg_id_t > pg_ids;
+                ho_.get_pg_ids(pg_ids);
+
+                LOGINFO("GC job {} will process {} PGs", job_id, pg_ids.size());
+
+                // 3. Process each PG separately
+                for (const auto& pg_id : pg_ids) {
+                    auto hs_pg = const_cast< HSHomeObject::HS_PG* >(ho_.get_hs_pg(pg_id));
+                    RELEASE_ASSERT(hs_pg, "HS PG {} not found during GC job {}", pg_id, job_id);
+
+                    // 3.1 Drain pending GC tasks for this PG first
+                    LOGINFO("GC job {} draining pending GC tasks for PG {}", job_id, pg_id);
+                    gc_mgr->drain_pg_pending_gc_task(pg_id);
+
+                    // 3.2 Get all chunks for this PG
+                    auto pg_sb = hs_pg->pg_sb_.get();
+                    std::vector< homestore::chunk_num_t > pg_chunks(pg_sb->get_chunk_ids(),
+                                                                    pg_sb->get_chunk_ids() + pg_sb->num_chunks);
+
+                    LOGINFO("GC job {} processing PG {} with {} chunks", job_id, pg_id, pg_chunks.size());
+
+                    // 3.3 Drain all pending requests and refuse new requests (prevents destroy_pg and other requests)
+                    hs_pg->repl_dev_->quiesce_reqs();
+
+                    // 3.4 Submit GC task for each eligible chunk
+                    std::vector< folly::SemiFuture< bool > > pg_futures;
+                    for (const auto& chunk_id : pg_chunks) {
+                        total_chunks++;
+                        // Determine priority based on chunk state (INUSE means has open shard)
+                        auto chunk = chunk_selector->get_extend_vchunk(chunk_id);
+                        RELEASE_ASSERT(chunk, "Chunk {} not found during GC job {}", chunk_id, job_id);
+                        auto priority =
+                            chunk->m_state == ChunkState::INUSE ? task_priority::emergent : task_priority::normal;
+
+                        // Clear in-memory requests only for emergent priority chunks (chunks with open shards)
+                        if (priority == task_priority::emergent) { hs_pg->repl_dev_->clear_chunk_req(chunk_id); }
+
+                        // Submit GC task for this chunk
+                        auto future = gc_mgr->submit_gc_task(priority, chunk_id);
+                        pg_futures.push_back(std::move(future));
+                        LOGDEBUG("GC job {} submitted task for chunk_id={} in PG {} with priority={}", job_id, chunk_id,
+                                 pg_id, (priority == task_priority::emergent) ? "emergent" : "normal");
+                    }
+
+                    // 3.5 Wait for all GC tasks in this PG to complete
+                    folly::collectAllUnsafe(pg_futures)
+                        .thenValue([&success_count, &failed_count](auto&& results) {
+                            for (auto const& ok : results) {
+                                RELEASE_ASSERT(ok.hasValue(), "we never throw any exception when copying data");
+                                if (ok.value()) {
+                                    success_count++;
+                                } else {
+                                    failed_count++;
+                                }
+                            }
+                        })
+                        .get();
+
+                    LOGINFO("GC job {} completed PG {}: submitted={}, success={}, failed={}", job_id, pg_id,
+                            pg_futures.size(), success_count, failed_count);
+
+                    // 3.6 Resume accepting new requests
+                    hs_pg->repl_dev_->resume_accepting_reqs();
+                    LOGINFO("GC job {} resumed accepting requests for PG {}", job_id, pg_id);
+                }
+
+                job_info->total_chunks = total_chunks;
+                job_info->success_count = success_count;
+                job_info->failed_count = failed_count;
+
+                LOGINFO("GC job {} completed: total={}, success={}, failed={}", job_id, total_chunks, success_count,
+                        failed_count);
+
+                // Job is considered successful if all tasks succeeded or no tasks failed
+                job_info->result = (failed_count == 0);
+                job_info->status = job_info->result.value() ? GCJobStatus::COMPLETED : GCJobStatus::FAILED;
+
+                // Restart the GC scan timer
+                LOGINFO("GC job {} restarting GC scan timer", job_id);
+                gc_mgr->start_gc_scan_timer();
+
+                job_info->updated_at = std::chrono::system_clock::now();
+                job_info->promise.setValue(job_info->result.value_or(false));
+            });
+
+        result["job_id"] = job_id;
+        result["message"] = "GC triggered for all eligible chunks";
+        response.send(Pistache::Http::Code::Accepted, result.dump());
+    } else {
+        uint32_t chunk_id = std::stoul(chunk_id_param.value());
+        LOGINFO("Received trigger_gc request for chunk_id={}, job_id={}", chunk_id, job_id);
+
+        auto chunk = chunk_selector->get_extend_vchunk(chunk_id);
+        if (!chunk) {
+            nlohmann::json error;
+            error["error"] = "Chunk not found";
+            response.send(Pistache::Http::Code::Not_Found, error.dump());
+            return;
+        }
+
+        if (chunk->m_pg_id.has_value()) {
+            nlohmann::json error;
+            error["error"] = "Chunk belongs to no pg";
+            response.send(Pistache::Http::Code::Not_Found, error.dump());
+            return;
+        }
+
+        const auto pg_id = chunk->m_pg_id.value();
+
+        auto pdev_id = chunk->get_pdev_id();
+
+        // Check for active job and create new job atomically under the same lock
+        auto job_info = std::make_shared< GCJobInfo >(job_id, chunk_id, pdev_id);
+        {
+            std::lock_guard< std::mutex > lock(gc_job_mutex_);
+            // Check if there is already an active GC job
+            if (current_gc_job_ &&
+                (current_gc_job_->status == GCJobStatus::PENDING || current_gc_job_->status == GCJobStatus::RUNNING)) {
+                nlohmann::json error;
+                error["error"] = "A GC job is already in progress";
+                error["active_job_id"] = current_gc_job_->job_id;
+                error["active_job_status"] = (current_gc_job_->status == GCJobStatus::PENDING) ? "pending" : "running";
+                response.send(Pistache::Http::Code::Conflict, error.dump());
+                return;
+            }
+            // Create new job and set as current (replacing any completed job)
+            current_gc_job_ = job_info;
+        }
+
+        iomanager.run_on_forget(
+            iomgr::reactor_regex::random_worker, [this, gc_mgr, job_id, chunk_id, chunk_selector, job_info, pg_id]() {
+                job_info->status = GCJobStatus::RUNNING;
+                job_info->updated_at = std::chrono::system_clock::now();
+
+                // Determine priority based on chunk state (INUSE means has open shard)
+                auto chunk = chunk_selector->get_extend_vchunk(chunk_id);
+                RELEASE_ASSERT(chunk, "Chunk {} not found during GC job {}", chunk_id, job_id);
+                auto priority = chunk->m_state == ChunkState::INUSE ? task_priority::emergent : task_priority::normal;
+
+                // Clear in-memory requests only for emergent priority chunks (chunks with open shards)
+                auto hs_pg = const_cast< HSHomeObject::HS_PG* >(ho_.get_hs_pg(pg_id));
+                RELEASE_ASSERT(hs_pg, "HS PG {} not found during GC job {}", pg_id, job_id);
+                bool res;
+                if (priority == task_priority::emergent) {
+                    hs_pg->repl_dev_->quiesce_reqs();
+                    hs_pg->repl_dev_->clear_chunk_req(chunk_id);
+                    res = gc_mgr->submit_gc_task(priority, chunk_id).get();
+                    hs_pg->repl_dev_->resume_accepting_reqs();
+                } else {
+                    res = gc_mgr->submit_gc_task(priority, chunk_id).get();
+                }
+
+                job_info->result = res;
+                job_info->status = res ? GCJobStatus::COMPLETED : GCJobStatus::FAILED;
+                job_info->updated_at = std::chrono::system_clock::now();
+                job_info->promise.setValue(res);
+
+                LOGINFO("GC task completed for chunk_id={}, job_id={}, result={}", chunk_id, job_id, res);
+            });
+
+        result["job_id"] = job_id;
+        result["message"] = "GC triggered for chunk";
+        result["chunk_id"] = chunk_id;
+        result["pdev_id"] = pdev_id;
+        response.send(Pistache::Http::Code::Accepted, result.dump());
+    }
+}
+
+std::string HttpManager::generate_job_id() {
+    auto counter = job_counter_.fetch_add(1, std::memory_order_relaxed);
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast< std::chrono::milliseconds >(now.time_since_epoch()).count();
+    return fmt::format("gc-{}-{}", timestamp, counter);
+}
+
+void HttpManager::get_gc_job_status(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response) {
+    auto job_id_param = request.query().get("job_id");
+    if (!job_id_param) {
+        response.send(Pistache::Http::Code::Bad_Request, "job_id is required");
+        return;
+    }
+
+    std::string job_id = job_id_param.value();
+
+    std::shared_ptr< GCJobInfo > job_info;
+    {
+        std::lock_guard< std::mutex > lock(gc_job_mutex_);
+        if (!current_gc_job_ || current_gc_job_->job_id != job_id) {
+            nlohmann::json error;
+            error["error"] = "Job not found";
+            error["job_id"] = job_id;
+            response.send(Pistache::Http::Code::Not_Found, error.dump());
+            return;
+        }
+        job_info = current_gc_job_;
+    }
+
+    // Access job_info outside the lock
+    nlohmann::json result;
+    result["job_id"] = job_info->job_id;
+
+    switch (job_info->status) {
+    case GCJobStatus::PENDING:
+        result["status"] = "pending";
+        break;
+    case GCJobStatus::RUNNING:
+        result["status"] = "running";
+        break;
+    case GCJobStatus::COMPLETED:
+        result["status"] = "completed";
+        break;
+    case GCJobStatus::FAILED:
+        result["status"] = "failed";
+        break;
+    }
+
+    auto created_ms =
+        std::chrono::duration_cast< std::chrono::milliseconds >(job_info->created_at.time_since_epoch()).count();
+    auto updated_ms =
+        std::chrono::duration_cast< std::chrono::milliseconds >(job_info->updated_at.time_since_epoch()).count();
+    result["created_at"] = created_ms;
+    result["updated_at"] = updated_ms;
+
+    // Single chunk GC info
+    if (job_info->chunk_id.has_value()) {
+        result["chunk_id"] = job_info->chunk_id.value();
+        if (job_info->pdev_id.has_value()) { result["pdev_id"] = job_info->pdev_id.value(); }
+    }
+
+    // Batch GC statistics (for all chunks)
+    if (job_info->total_chunks > 0) {
+        nlohmann::json stats;
+        stats["total_chunks"] = job_info->total_chunks;
+        stats["success_count"] = job_info->success_count;
+        stats["failed_count"] = job_info->failed_count;
+        result["statistics"] = stats;
+    }
+
+    if (job_info->result.has_value()) { result["result"] = job_info->result.value(); }
+
+    response.send(Pistache::Http::Code::Ok, result.dump());
 }
 
 #ifdef _PRERELEASE

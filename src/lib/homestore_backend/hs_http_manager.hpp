@@ -16,6 +16,11 @@
 #include <iomgr/io_environment.hpp>
 #include <iomgr/http_server.hpp>
 
+#include <folly/futures/Future.h>
+#include <folly/concurrency/ConcurrentHashMap.h>
+#include <chrono>
+#include <atomic>
+
 namespace homeobject {
 class HSHomeObject;
 
@@ -33,12 +38,47 @@ private:
     void dump_chunk(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response);
     void dump_shard(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response);
     void get_shard(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response);
+    void trigger_gc(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response);
+    void get_gc_job_status(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response);
 
 #ifdef _PRERELEASE
     void crash_system(const Pistache::Rest::Request& request, Pistache::Http::ResponseWriter response);
 #endif
 
 private:
+    enum class GCJobStatus { PENDING, RUNNING, COMPLETED, FAILED };
+
+    struct GCJobInfo {
+        std::string job_id;
+        GCJobStatus status;
+        std::chrono::system_clock::time_point created_at;
+        std::chrono::system_clock::time_point updated_at;
+        std::optional< uint32_t > chunk_id;
+        std::optional< uint32_t > pdev_id;
+        std::optional< bool > result;
+        folly::Promise< bool > promise;
+
+        // Statistics for batch GC jobs (all chunks)
+        uint32_t total_chunks{0};
+        uint32_t success_count{0};
+        uint32_t failed_count{0};
+
+        GCJobInfo(const std::string& id, std::optional< uint32_t > cid = std::nullopt,
+                  std::optional< uint32_t > pid = std::nullopt) :
+                job_id(id),
+                status(GCJobStatus::PENDING),
+                created_at(std::chrono::system_clock::now()),
+                updated_at(std::chrono::system_clock::now()),
+                chunk_id(cid),
+                pdev_id(pid) {}
+    };
+
+    std::string generate_job_id();
+
+private:
     HSHomeObject& ho_;
+    std::atomic< uint64_t > job_counter_{0};
+    std::shared_ptr< GCJobInfo > current_gc_job_{nullptr};
+    std::mutex gc_job_mutex_;
 };
 } // namespace homeobject
